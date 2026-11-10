@@ -204,7 +204,7 @@ IDLE_WIRES = True
 # M's restored top too, instead of the carrier the second chain has just dropped.
 RESTORE_IDLE = True
 # The tick's compare as wide.gt_tree on clean scratch, in blocks of this many bits (0 = compare_blocks).
-WIDE_CMP = 4
+WIDE_CMP = 5
 # The tick's add in blocks of this many bits, each with its own temps (0 = LA_F_WIDE / LA_B_WIDE).
 WIDE_ADD = 6
 WIDE_ADD_COPIES = 16
