@@ -501,3 +501,43 @@ This branch builds on ab-godder's `mike/comp-ab-godder-pr9-286e36a3ba9f` (`lowt-
 On a held lane l0 = R0, so c1 is the k0 AND R0 term of bit one, and bit one reads it from c1 instead of computing and uncomputing it on a fresh wire around its use.
 c1 is cleared with one CCX, l0 AND k0, after the B1 drop and before k0 changes, and its wire is freed.
 Every tick call with a previous cell saves 2 CCX, 764 of the 766 calls at secp256k1, so the circuit at G loses 1,528 CCX at the same 3,135 wires.
+
+## Junk wires under the wire cap
+
+This branch builds on iwnlcern's `jack/comp-iwnlcern-pr10-0e70e4252785` (`v2/lowt-c1` at `a4d4c28`).
+That circuit peaks at 3,135 wires, in the square, and the multiplier M runs at 1,312.
+The cap is 4,096, and qubit-time at 4,096 wires stays below the reference's.
+So this branch fills the wires up to the cap with junk that saves CCX, in two places.
+
+**The rule.** A block that is applied forward and later inverted, with nothing in between writing a wire the block read, is a compute and uncompute pair.
+Inside such a block, a temporary that the block clears with a CCX can stay set on a wire of its own.
+The forward block loses the CCX that cleared it, and the inverse loses the CCX that rebuilt it.
+The wire holds a function of the block's input, so the inverse meets the value it expects.
+The price is one wire, held from the forward block to its inverse.
+
+**Euclid carries** (`_shared_difference`, `_euclid_step`, `_euclid_pass` and `_body` in `qec/point_add.py`).
+M is the forward Euclid pass, the Bezout pass, and the inverse Euclid pass, and the Bezout pass restores every wire the Euclid pass wrote.
+A step's shared difference builds its carries in place on U and spends one CCX a bit to restore a_i.
+With `junk` set, the carry out of each bit 1..k goes onto a junk wire as c ^ (a ^ c)(b ^ c), which leaves a_i and b_i in place, so those bits need no restore: 3 CCX a bit, not 4.
+The bits above k run the in-place chain as before, with the last junk wire as their carry in, which their unwind restores.
+The step's second-strip flag `two` can also stay on a junk wire, which drops the CCX that cleared it.
+`_euclid_pass` hands the junk wires to its steps in order, each step's carries first and then its flag, and skips the first step, which may be `_euclid_tick0`, and the last.
+`_body` allocates the junk before the forward pass and frees it after the inverse pass.
+Each wire saves one CCX in the pass and one in its inverse, and M runs twice, so a wire is worth 4 CCX.
+
+**Square row carries** (`_keep_add`, `_rows` and `SquareFold` in `qec/square.py`).
+ab-godder's `SquareFold.KEEP` already did this for the Karatsuba leaves' rows and was left at 0.
+It is now a constructor argument, and a row that K cannot cover in full keeps the carries K still has and finishes as a plain add.
+Compute runs once and its inverse once, so a wire is worth 2 CCX.
+`_Lend` lends the fold's wires E, T, t, c and k, which are clean until the fold, to the allocator during the Karatsuba recursion.
+Its adds then take their pads and constant-add carries from those wires, and compute's own scratch falls from 128 wires to 32, below the modadd's 41.
+That gives 87 more wires to the rows.
+
+**The budget** (`ControlledPointAdd._junk_budgets`).
+Each stage is built alone with no junk to find its peak, and the room left under `WIRES_PER_BIT * n`, 4,096 at n = 256, is the stage's budget.
+At secp256k1 that is 2,784 wires for each Euclid pass, of the 65,279 it could use, and 1,048 for the square's rows.
+The circuit at G loses 13,232 CCX: 11,136 in the four Euclid passes and 2,096 in the square.
+
+`scripts/junk_check.py` runs M on every x at every odd prime below 600 for eleven junk budgets, and the square's compute on every Y at every prime below 16,384 where the fold applies for up to eight keep budgets.
+It also checks that the CCX saved is exactly 2 per junk wire used in M and 1 per kept wire in compute.
+
