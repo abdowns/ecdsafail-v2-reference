@@ -45,14 +45,19 @@ def gt_case(width, block, cases):
     return C, failing
 
 
-def prefix_case(h, block, cases):
-    """cases: (bits, t). `out` takes AND(bits) before the write, `hook` takes t * z inside it."""
+def prefix_case(h, block, cases, hooked=True):
+    """cases: (bits, t). `out` takes AND(bits) before the write, `hook` takes t * z inside it, or,
+    with no hook in the write, the same product from the bits before it."""
     C = Circuit()
     bits = C.alloc(h)
     t, out, hook = C.alloc(3)
     P = wide.PrefixTree(C, bits, block)
     C.cx(P.top, out)
-    P.write(t, lambda z: C.ccx(t, z, hook))
+    if hooked:
+        P.write(t, lambda z: C.ccx(t, z, hook))
+    else:
+        C.ccx(t, P.top, hook)
+        P.write(t)
     init = sim.pack([c[0] for c in cases], bits)
     init.update(sim.pack([c[1] for c in cases], [t]))
     full = (1 << h) - 1
@@ -69,8 +74,9 @@ def prefix_case(h, block, cases):
     return C, failing
 
 
-def low_case(w, quiet, masks, block, cases, write):
-    """cases: (L, selector bits)."""
+def low_case(w, quiet, masks, block, cases, write, aside=False):
+    """cases: (L, selector bits). aside: the write that falls against copies, its hook reading
+    L[1:a] as sums, and release() at the end."""
     a, b = quiet
     C = Circuit()
     L, sel = C.alloc(w), C.alloc(len(masks))
@@ -78,7 +84,17 @@ def low_case(w, quiet, masks, block, cases, write):
     M = wide.PrefixTree(C, L[a:b], 3) if b > a else None
     add = wide.LowAdd(C, L, sel, masks, quiet, M.top if M else None, block)
     C.cx(add.top, out)
-    if write:
+    (seen,) = C.alloc(1)
+    if write and aside:
+        def hook():
+            if a > 1:
+                C.cx(L[1], seen)
+        add.write((lambda c, mid: M.write(c, mid, carries_first=True)) if M else None, aside=True,
+                  before_falls=hook)
+        if a > 1:
+            C.cx(add.copies[1], seen)                   # the copy holds L[1]'s sum after the falls
+        add.release()
+    elif write:
         add.write(M.write if M else None)
     else:
         add.undo()
@@ -149,9 +165,10 @@ count = 0
 for h in range(1, 11):
     cases = [(v, c) for v in range(1 << h) for c in (0, 1)]
     for block in range(1, 7):
-        C, failing = prefix_case(h, block, cases)
-        fails += failing(C.ops)
-        count += 1
+        for hooked in (True, False):
+            C, failing = prefix_case(h, block, cases, hooked)
+            fails += failing(C.ops)
+            count += 1
 print(f"PrefixTree: {count} circuits on every input, h 1..10: failing {fails}")
 for h in (20, 33, 221, 222):
     full = (1 << h) - 1
@@ -160,8 +177,9 @@ for h in (20, 33, 221, 222):
         v = (rng.getrandbits(h) >> k << k | (1 << k) - 1) & full
         cases += [(v, 0), (v, 1)]
     for block in (2, 3, 4, 5, 8, 16):
-        C, failing = prefix_case(h, block, cases)
-        fails += failing(C.ops)
+        for hooked in (True, False):
+            C, failing = prefix_case(h, block, cases, hooked)
+            fails += failing(C.ops)
 print(f"PrefixTree: h 20..222, the lowest 0 at every position: failing {fails}")
 
 count = 0
@@ -173,8 +191,8 @@ for w in range(2, 9):
                 masks = [rng.getrandbits(w) & ~run_bits | 1 for _ in range(rng.randrange(1, 4))]
                 cases = [(Lv, sv) for Lv in range(1 << w) for sv in range(1 << len(masks))]
                 for block in (1, 2, 3, 4, 8):
-                    for write in (False, True):
-                        C, failing = low_case(w, (a, b), masks, block, cases, write)
+                    for write, aside in ((False, False), (True, False), (True, True)):
+                        C, failing = low_case(w, (a, b), masks, block, cases, write, aside)
                         fails += failing(C.ops)
                         count += 1
 print(f"LowAdd: {count} circuits on every input, w 2..8, every quiet run: failing {fails}")
@@ -189,8 +207,8 @@ for masks in ([f, f ^ 2 * f, f ^ 3 * f, corner ^ 4 * f], [corner, f, 2 * f, 4 * 
             Lv |= (1 << 32) - (1 << 12)                 # the quiet run all ones
         cases.append((Lv, rng.getrandbits(4)))
     for block in (1, 2, 3, 4, 6, 12):
-        for write in (False, True):
-            C, failing = low_case(w, (12, 32), masks, block, cases, write)
+        for write, aside in ((False, False), (True, False), (True, True)):
+            C, failing = low_case(w, (12, 32), masks, block, cases, write, aside)
             fails += failing(C.ops)
 print(f"LowAdd: secp256k1's masks, w = {w}, quiet run 12..32, 600 drawn inputs: failing {fails}")
 
@@ -203,7 +221,9 @@ cases = [(x, y, z, t) for x in range(1 << width) for y in range(1 << width) for 
 for name, (C, failing) in (
         ("gt_tree", gt_case(width, (2, 3, 4, 5), cases)),
         ("PrefixTree", prefix_case(9, 3, [(v, c) for v in range(1 << 9) for c in (0, 1)])),
+        ("PrefixTree, no hook", prefix_case(9, 4, [(v, c) for v in range(1 << 9) for c in (0, 1)], False)),
         ("LowAdd write", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True)),
+        ("LowAdd write aside", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True, True)),
         ("LowAdd undo", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, False))):
     seen, total = mutants(C, failing)
     missed += total - seen
