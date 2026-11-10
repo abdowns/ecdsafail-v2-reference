@@ -455,7 +455,7 @@ def lookahead_sweep(C, U, V, temps, spec=None):
     lookahead_chain(C, U, V, temps, lookahead_sizes(n - 1))
 
 
-def add_lookahead(C, a, b, cout, temps, tree=False, cin=None):
+def add_lookahead(C, a, b, cout, temps, tree=False, cin=None, spec=None):
     """b += a mod 2^w and cout ^= the carry out (none if cout is None), as add, with both sweeps in
     lookahead form. A wire holding 1 as cin adds 1, as in add; the sweeps restore it.
     The up-sweep leaves add's state after its last _maj (b_i = p_i, the carry wire c_0 ^ a_0,
@@ -475,7 +475,7 @@ def add_lookahead(C, a, b, cout, temps, tree=False, cin=None):
     up.cx(a[0], cin)
     if tree:
         adjacent_xor(up, a)
-        lookahead_sweep(up, [cin] + list(a), [None] + list(b), temps)
+        lookahead_sweep(up, [cin] + list(a), [None] + list(b), temps, spec)
     else:
         for i in range(w - 1):
             up.cx(a[i + 1], a[i])

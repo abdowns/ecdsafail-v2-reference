@@ -7,6 +7,8 @@ gt_tree     t ^= ctrl * [A > B], with A, B and ctrl restored and the scratch cle
 gt_sweep    the same map over arith.carry_trees' blocks.
 PrefixTree  .top = AND(bits). write(t, mid) leaves bits + t mod 2^h and t, cleans the scratch, and
             hands mid a wire z with t * z = t * AND(old bits).
+PrefixSplit the same .top (when asked for) and write(t), the high half's tree on the low half's
+            own wires (PrefixLent).
 LowAdd      .top = the carry out of L + K, K the XOR of the selected masks. undo() restores every
             wire. write() leaves L[0] alone and adds K and its carries into L[1:], the quiet run
             through a PrefixTree's write. The aside write also with its low carries cleared by a
@@ -137,6 +139,32 @@ def _low_case(w, a, b, masks, block, cases, write, aside):
     return C, failing
 
 
+def split_case(h, block, cases, top=True):
+    """cases: (bits, t). With top, `out` takes AND(bits) and `hook` t * AND(bits) before the write."""
+    C = Circuit()
+    bits = C.alloc(h)
+    t, out, hook = C.alloc(3)
+    P = wide.PrefixSplit(C, bits, block, top)
+    if top:
+        C.cx(P.top, out)
+        C.ccx(t, P.top, hook)
+    P.write(t)
+    init = sim.pack([c[0] for c in cases], bits)
+    init.update(sim.pack([c[1] for c in cases], [t]))
+    full = (1 << h) - 1
+
+    def failing(ops):
+        n = len(cases)
+        st = sim.run(ops, C.num_wires, init, n)
+        got, seen, carry = sim.unpack(st, bits, n), sim.unpack(st, [out], n), sim.unpack(st, [hook], n)
+        bad = sum(got[i] != (v + c) & full or seen[i] != (top and v == full) or carry[i] != (top and c and v == full)
+                  for i, (v, c) in enumerate(cases))
+        bad += st[t] != init[t]
+        return bad + sum(1 for w in range(C.num_wires) if w not in (*bits, t, out, hook) and st[w])
+
+    return C, failing
+
+
 def mutants(C, failing):
     """(seen, total) over the circuit's CCX-to-CX mutants."""
     ops = C.ops
@@ -217,6 +245,27 @@ for h in (20, 33, 221, 222):
             fails += failing(C.ops)
 print(f"PrefixTree: h 20..222, the lowest 0 at every position: failing {fails}")
 
+count = 0
+for h in range(1, 12):
+    cases = [(v, c) for v in range(1 << h) for c in (0, 1)]
+    for block in range(1, 7):
+        for top in (True, False):
+            C, failing = split_case(h, block, cases, top)
+            fails += failing(C.ops)
+            count += 1
+print(f"PrefixSplit: {count} circuits on every input, h 1..11: failing {fails}")
+for h in (20, 33, 191, 223):
+    full = (1 << h) - 1
+    cases = [(full, 1), (full, 0), (0, 1), (0, 0)]
+    for k in list(range(h + 1)) * 2:                    # the lowest 0 at every position
+        v = (rng.getrandbits(h) >> k << k | (1 << k) - 1) & full
+        cases += [(v, 0), (v, 1)]
+    for block in (2, 4, 5, 8):
+        for top in (True, False):
+            C, failing = split_case(h, block, cases, top)
+            fails += failing(C.ops)
+print(f"PrefixSplit: h 20..223, the lowest 0 at every position: failing {fails}")
+
 FALLS = ((2, 2, 2, 2, 2), (None, 2, 8, 2, 2), (2, None, 16, 3, 2), (None, None, 16, 2, 1))
 MODES = [(False, False, None), (True, False, None), (True, True, None)] + [(True, True, f) for f in FALLS]
 count = 0
@@ -260,6 +309,8 @@ for name, (C, failing) in (
         ("gt_sweep", gt_case(width, None, cases, (2, None, 128, 2, 2))),
         ("PrefixTree", prefix_case(9, 3, [(v, c) for v in range(1 << 9) for c in (0, 1)])),
         ("PrefixTree, no hook", prefix_case(9, 4, [(v, c) for v in range(1 << 9) for c in (0, 1)], False)),
+        ("PrefixSplit", split_case(9, 2, [(v, c) for v in range(1 << 9) for c in (0, 1)])),
+        ("PrefixSplit, no top", split_case(10, 3, [(v, c) for v in range(1 << 10) for c in (0, 1)], False)),
         ("LowAdd write", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True)),
         ("LowAdd write aside", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True, True)),
         ("LowAdd write aside, tree falls", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True, True, (2, 2, 2, 2, 2))),

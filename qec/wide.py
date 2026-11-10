@@ -314,7 +314,76 @@ class PrefixTree:
         for x in self.bits:
             C.x(x)
         C.free(made[::-1])
-        C.free(self.taken[::-1])
+        self._give()
+
+    def _give(self):
+        self.C.free(self.taken[::-1])
+
+
+class PrefixLent(PrefixTree):
+    """PrefixTree with its chains and tree on lent wires in place of clean scratch.
+
+    lend: wires that all hold 1 in every state where the AND of these bits is read or a carry
+    enters them, and that nothing else touches until write is done. Each one taken sits under an X,
+    so in those states it starts clean and holds what PrefixTree's wire would. Everywhere else it
+    holds that XOR a fixed bit, and no gate lets that out: a chain or tree wire is read either
+    beside a carry on a clean wire, which is 1 only in those states, or by a gate that the same
+    gate on the same controls undoes. With no carry in, the bits do not change, so the clears
+    that PrefixTree computes from the new bits are those same gates. The carries stay on clean
+    wires. The caller reads .top only beside a wire that is 1 only when the lent wires are.
+    """
+
+    def __init__(self, C, bits, block, lend):
+        self.lend = list(lend)
+        super().__init__(C, bits, block)
+
+    def _alloc(self):
+        w = self.lend.pop(0)
+        self.C.x(w)
+        self.taken.append(w)
+        return w
+
+    def _give(self):
+        for w in reversed(self.taken):
+            self.C.x(w)
+
+
+class PrefixSplit:
+    """bits += t, and AND(bits) on .top when asked for, on about half a PrefixTree's clean scratch.
+
+    The low half of the bits is a PrefixTree. The high half is a PrefixLent on the low half's own
+    wires: its AND counts and a carry reaches it only when the low half is all ones. write adds to
+    the high half first, with the carry t * AND(low half) on a wire of its own, cleared from the
+    low tree's top before the low half takes t.
+    """
+
+    def __init__(self, C, bits, block=4, top=True):
+        self.C = C
+        bits = list(bits)
+        cut = len(bits) - len(bits) // 2                  # the high half needs one wire a bit, less one
+        self.lo = PrefixTree(C, bits[:cut], block)
+        self.hi = PrefixLent(C, bits[cut:], block, bits[:cut]) if cut < len(bits) else None
+        self.top = None
+        if top and self.hi is None:
+            self.top = self.lo.top
+        elif top:
+            (self.top,) = C.alloc(1)
+            C.ccx(self.lo.top, self.hi.top, self.top)
+
+    def write(self, t):
+        C = self.C
+        if self.hi is None:
+            self.lo.write(t)
+            return
+        if self.top is not None:
+            C.ccx(self.lo.top, self.hi.top, self.top)
+            C.free([self.top])
+        (c,) = C.alloc(1)
+        C.ccx(t, self.lo.top, c)
+        self.hi.write(c)
+        C.ccx(t, self.lo.top, c)
+        C.free([c])
+        self.lo.write(t)
 
 
 # write(aside=True) clears the carries below the quiet run by arith.CarrySweep over carry_trees'
