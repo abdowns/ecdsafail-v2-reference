@@ -5,6 +5,13 @@ name as an output, and leaves every scratch wire it allocates clean.
 """
 
 
+def target(C, *inputs):
+    """A clean wire for a gate that reads `inputs`: the circuit's alloc_after when it has one, which
+    picks a wire that is free by the time the inputs are, else its next wire."""
+    pick = getattr(C, "alloc_after", None)
+    return pick(*inputs) if pick else C.alloc(1)[0]
+
+
 class Tape:
     """Records gates so a compute can be replayed in reverse as its uncompute."""
 
@@ -41,6 +48,18 @@ def and_tree(T, bits, alloc):
     return level[0]
 
 
+def _spans(n, block):
+    """[lo, hi) blocks covering n bits: `block` bits each, or, when it is a tuple, its sizes from
+    the bottom with the last one repeated."""
+    sizes = block if isinstance(block, tuple) else (block,)
+    out, lo, k = [], 0, 0
+    while lo < n:
+        hi = min(lo + sizes[min(k, len(sizes) - 1)], n)
+        out.append((lo, hi))
+        lo, k = hi, k + 1
+    return out
+
+
 def _carry_out(T, A, B, alloc, block):
     """The carry out of A + B, no carry in, onto A's top wire. Blocks of `block` bits ripple in
     place as CDKM majorities, each from its own clean carry-in, which leaves A[i] ^ B[i] on B[i].
@@ -48,8 +67,7 @@ def _carry_out(T, A, B, alloc, block):
     made only for a node that is some join's upper half."""
     n = len(A)
     nodes = []
-    for lo in range(0, n, block):
-        hi = min(lo + block, n)
+    for lo, hi in _spans(n, block):
         cin = alloc()
         T.cx(A[lo], B[lo])
         T.cx(A[lo], cin)
@@ -168,7 +186,9 @@ class PrefixTree:
     def restore(self):
         pass
 
-    def write(self, t):
+    def write(self, t, mid=None):
+        """mid(z), when given, runs while z holds AND(~new bits), before t's last use: t * z is
+        the carry out of the bits, t * AND(old bits)."""
         C = self.C
         if not self.bits:
             return
@@ -180,14 +200,14 @@ class PrefixTree:
                 node["cin"] = c
                 return
             lo, hi = node["kids"]
-            (ch,) = C.alloc(1)
+            ch = target(C, c, lo["a"])
             made.append(ch)
             carries.ccx(c, lo["a"], ch)
+            C.ccx(c, lo["a"], ch)
             down(lo, c)
             down(hi, ch)
 
         down(self.root, t)
-        carries.play(C)
         for blk in self.blocks:
             seg, q, cin = blk["seg"], blk["q"], blk["cin"]
             for k in range(len(seg) - 1, 0, -1):
@@ -205,6 +225,8 @@ class PrefixTree:
             C.x(x)
         self.chains.play(C)
         self.tree.play(C)
+        if mid is not None:
+            mid(self.top)
         carries.play(C, reverse=True)
         self.tree.play(C, reverse=True)
         self.chains.play(C, reverse=True)
@@ -302,7 +324,10 @@ class LowAdd:
         self._free()
 
     def write(self, quiet_write):
-        """quiet_write(c) adds the carry wire c into the quiet run."""
+        """quiet_write(c, mid) adds the carry wire c into the quiet run, and calls mid(z) once,
+        before c's last use, with a wire z for which c * z = c * [the run was all ones]: the old
+        mtop before the run changes, or AND(~run) after. The quiet run's write does not wait for
+        the top stretch, whose first fall waits for whoever still reads .top."""
         C, L, K = self.C, self.L, self.K
         # Make each later block's state the single chain's: true inner carries, its products
         # cleared, and its carry-in wire traded for the wire below it.
@@ -336,12 +361,16 @@ class LowAdd:
             else:
                 C.cx(K[i], L[i])
 
-        for i in reversed(range(self.b, len(L))):
-            fall(i)
+        def top(z):
+            for i in reversed(range(self.b, len(L))):
+                fall(i)
+            C.ccx(K[self.a - 1], z, self.skip)
+
         if self.skip is not None:
-            C.ccx(K[self.a - 1], self.mtop, self.skip)
-        if self.b > self.a:
-            quiet_write(K[self.a - 1])
+            quiet_write(K[self.a - 1], top)
+        else:
+            for i in reversed(range(self.b, len(L))):
+                fall(i)
         for i in reversed(range(self.a)):
             fall(i)
         self.fan.play(C, reverse=True)

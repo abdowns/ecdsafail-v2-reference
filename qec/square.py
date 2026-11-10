@@ -28,7 +28,7 @@ MODADD_TEMPS = 95
 MODADD_COPIES = 15
 # Run the fold's adds as add_lookahead trees, on FOLD_TEMPS clean wires and the fold's clean junk.
 FOLD_TREE = True
-FOLD_TEMPS = 86
+FOLD_TEMPS = 126
 # Split the rows once (Karatsuba): the pairs inside each half of Y add side by side on the two
 # halves of Q, and the pairs across the halves come from the rows of the halves' sum, a quarter
 # fewer row bits in all. The sum's rows and the sum stay on junk wires.

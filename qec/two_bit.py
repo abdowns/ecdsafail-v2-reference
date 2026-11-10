@@ -22,7 +22,7 @@ from functools import lru_cache
 import heapq
 
 from . import wide
-from .arith import Mod, _maj, _selected_carry, cswap, gt_into
+from .arith import Mod, _Gates, _emit, _maj, _selected_carry, adjacent_xor, cswap, gt_into
 
 
 @lru_cache(maxsize=None)
@@ -204,16 +204,32 @@ IDLE_WIRES = True
 # M's restored top too, instead of the carrier the second chain has just dropped.
 RESTORE_IDLE = True
 # The tick's compare as wide.gt_tree on clean scratch, in blocks of this many bits (0 = compare_blocks).
-WIDE_CMP = 5
+WIDE_CMP = (2, 3, 4, 5)
 # The tick's add in blocks of this many bits, each with its own temps (0 = LA_F_WIDE / LA_B_WIDE).
-WIDE_ADD = 6
+WIDE_ADD = 7
+# The add's blocks ramp from 1 up to WIDE_ADD at both ends, each size this many times.
+WIDE_ADD_RAMP = 2
 WIDE_ADD_COPIES = 16
+# Run the add's two CX waves through U as log-depth networks.
+WIDE_WAVE = False
 # The tick's P and M as wide.PrefixTree in blocks of this many bits (0 = PrefixR and Prefix). With
 # WIDE_P the first chain's carriers are clean wires, not borrowed H wires.
 WIDE_P = 4
-WIDE_M = 4
+WIDE_M = 3
 # The tick's two low chains as wide.LowAdd in blocks of this many bits (0 = _chain_up and _chain_down).
-WIDE_LOW = 4
+WIDE_LOW = 3
+# Give every scratch wire from the prefixes to the compare by when it comes free under the tick model,
+# earliest first, instead of off the stack: a wire one tree has just freed is busy until that tree
+# ends, and handing it to a tree that could run beside it makes the second wait for the first.
+WIDE_IDLE = True
+# Run the trial chain on copies, beside the second chain.
+WIDE_ASIDE = False
+
+
+# alloc_after counts a wire as free in time when it is free within this many ticks of the gate's
+# other wires, and may take up to IDLE_FRESH wires the tick has not touched when none is.
+IDLE_SLACK = 0
+IDLE_FRESH = 0
 
 
 class _Idle:
@@ -221,7 +237,7 @@ class _Idle:
     tick alone (every wire free at its start)."""
 
     def __init__(self, C, start):
-        self.C, self.pos, self.r = C, start, {}
+        self.C, self.pos, self.r, self.fresh = C, start, {}, 0
 
     def ready(self):
         r, ops = self.r, self.C.prims
@@ -243,6 +259,32 @@ class _Idle:
         """Index of the wire in wires that comes free first, the later one on a tie."""
         r = self.ready()
         return min(range(len(wires)), key=lambda i: (r.get(wires[i], 0), -i))
+
+    def alloc_after(self, *inputs):
+        """One clean wire for a gate whose other wires are `inputs`: the touched free wire that
+        comes free last among those free by the time the inputs are, so that the gate does not wait
+        for its target and earlier wires stay for earlier gates. With none, as alloc."""
+        C, r = self.C, self.ready()
+        t = max((r.get(w, 0) for w in inputs), default=0) + IDLE_SLACK
+        fit = [w for w in C.free_stack if w in r and r[w] <= t]
+        if not fit:
+            if self.fresh < IDLE_FRESH:
+                self.fresh += 1
+                return self._untouched()
+            return self.alloc(1)[0]
+        w = max(fit, key=lambda x: r[x])
+        C.free_stack.remove(w)
+        return w
+
+    def _untouched(self):
+        """A clean wire this tick has not touched: off the stack when it holds one, else a new wire."""
+        C, r = self.C, self.r
+        for w in reversed(C.free_stack):
+            if w not in r:
+                C.free_stack.remove(w)
+                return w
+        C.num_wires += 1
+        return C.num_wires - 1
 
     def alloc(self, k=1):
         """Clean wires this tick has touched, earliest free first; a fresh wire only when none is free,
@@ -412,6 +454,26 @@ def _la_wide(m, big, k, ends=1):
     return [1] * ends + mid[:len(mid) // 2] + [1] * odd + mid[len(mid) // 2:] + [1] * ends
 
 
+def _ramp_sizes(m, top, rep):
+    """Chain block sizes for m bits, bottom up: 1, then each size from 2 to top - 1 `rep` times,
+    blocks of `top` through the middle, and the same ramp down to 1 at the upper end. A block's
+    products take time in proportion to its size before the chain can cross it, and its fixes take
+    as long after, so a block near either end holds the sweep up unless it is short. A width too
+    small for both ramps keeps as much of each as fits; what is left over is one middle block."""
+    ramp = [1] + [k for k in range(2, top) for _ in range(rep)]
+    low, high, left, i = [], [], m, 0
+    while i < len(ramp) and left >= 2 * ramp[i]:
+        low.append(ramp[i])
+        high.append(ramp[i])
+        left -= 2 * ramp[i]
+        i += 1
+    mid = [top] * (left // top) if i == len(ramp) else []
+    left -= sum(mid)
+    out = low + mid[:len(mid) // 2] + ([left] if left else []) + mid[len(mid) // 2:] + high[::-1]
+    assert sum(out) == m and all(r >= 1 for r in out)
+    return out
+
+
 def _la_blocks(sizes):
     out, s = [], 0
     for r in sizes:
@@ -467,9 +529,18 @@ def add_or_shift_la(C, J, a, word, n, k2f=None, k2b=None, ntemps=5, ncopies=6, f
         ki[0] += 1
         return w
 
-    for j in range(m):
-        C.cx(U[j + 1], V[j])
-        C.cx(U[j + 1], U[j])
+    if WIDE_WAVE:
+        # The same map as the loop below, whose CXs chain through U one tick a bit: every V[j] takes
+        # the old U[j + 1], then U takes its adjacent XORs as a log-depth network.
+        for j in range(m):
+            C.cx(U[j + 1], V[j])
+        wave = _Gates()
+        adjacent_xor(wave, U)
+        _emit(C, wave.ops)
+    else:
+        for j in range(m):
+            C.cx(U[j + 1], V[j])
+            C.cx(U[j + 1], U[j])
 
     # carry and t are clean until the top, and every temp is returned clean, so they can serve as temps.
     temps = _LaTemps([carry, t] + tw if LA_TOP_TEMPS else tw, idle)
@@ -531,10 +602,17 @@ def add_or_shift_la(C, J, a, word, n, k2f=None, k2b=None, ntemps=5, ncopies=6, f
             for i in reversed(range(1, r)):
                 C.ccx(U[s + i], V[s + i], U[s + i + 1])
 
-    for j in reversed(range(m)):
-        C.cx(U[j + 1], U[j])
-        C.cx(U[j + 1], V[j])
-        C.cx(J, V[j])                                   # V ^= ~J
+    if WIDE_WAVE:
+        _emit(C, reversed(wave.ops))
+        for j in reversed(range(m)):
+            C.cx(U[j + 1], V[j])
+            C.cx(copy(), V[j])                          # V ^= ~J through J's copies, which hold J
+            C.x(V[j])
+    else:
+        for j in reversed(range(m)):
+            C.cx(U[j + 1], U[j])
+            C.cx(U[j + 1], V[j])
+            C.cx(J, V[j])                               # V ^= ~J
 
     def cswap(c, x, y):
         C.cx(y, x)
@@ -1013,9 +1091,8 @@ class TwoBitMod(Mod):
         if CDKM_ADD and self.n > 3:
             return add_or_shift_cdkm(C, J, a, word, self.n)
         if WIDE_ADD and self.n > 3:
-            m = self.n - 1
-            sizes = [1] + [WIDE_ADD] * ((m - 2) // WIDE_ADD) + [1] * ((m - 2) % WIDE_ADD) + [1]
-            temps = (WIDE_ADD - 1) * ((m - 2) // WIDE_ADD)
+            sizes = _ramp_sizes(self.n - 1, WIDE_ADD, WIDE_ADD_RAMP)
+            temps = sum(r - 1 for r in sizes)
             return add_or_shift_la(C, J, a, word, self.n, ntemps=max(temps, 1), ncopies=WIDE_ADD_COPIES,
                                    fsizes=sizes, bsizes=sizes)
         if LOOKAHEAD_ADD and self.n > 3:
@@ -1091,7 +1168,19 @@ class TwoBitMod(Mod):
             cswap(C, p, [g0], [high])
             C.cx(p, g0)
         sw = self._begin(C, g0, b)
-        if p is not None:
+        if p is not None and WIDE_WAVE and P_FAN > 1:
+            # p through copies on clean wires, so these CXs do not queue on one control; the add
+            # no longer hides the queue behind a wave of its own.
+            pc = [p] + C.alloc(4 * P_FAN - 1)
+            ptree = [(pc[j - (1 << (j.bit_length() - 1))], pc[j]) for j in range(1, len(pc))]
+            for src, dst in ptree:
+                C.cx(src, dst)
+            for i, x in enumerate(word):
+                C.cx(pc[i * len(pc) // len(word)], x)
+            for src, dst in reversed(ptree):
+                C.cx(src, dst)
+            C.free(pc[1:])
+        elif p is not None:
             for x in word:
                 C.cx(p, x)
         self._add_or_shift(C, b, a, word)
@@ -1141,6 +1230,7 @@ class TwoBitMod(Mod):
         idle = _Idle(C, tick_start) if IDLE_WIRES else None
         if idle:
             C.alloc = idle.alloc
+            C.alloc_after = idle.alloc_after
         if WIDE_P and len(H) > 1:
             P = wide.PrefixTree(C, H, WIDE_P)
         elif PARALLEL_PREFIX and len(H) > 1:
@@ -1148,8 +1238,8 @@ class TwoBitMod(Mod):
         else:
             P = Prefix(C, H, cap=37)
         M = wide.PrefixTree(C, L[ra:rb], WIDE_M) if WIDE_M and rb - ra > 1 else Prefix(C, L[ra:rb])
-        if idle:
-            del C.alloc
+        if idle and not WIDE_IDLE:
+            del C.alloc, C.alloc_after
         # Only M's skip reads M before its write, so the top below its last is cleared until then.
         M.release()
 
@@ -1179,7 +1269,22 @@ class TwoBitMod(Mod):
         C.ccx(k0, k1, three)
         selectors = [one, k0, k1, three]
         masks = [f, f ^ 2 * f, f ^ 3 * f, self.corner ^ 4 * f]
-        if WIDE_LOW:
+        aside = WIDE_LOW and WIDE_ASIDE
+        if aside:
+            # The trial chain runs on copies of its selectors and of L's bits outside the quiet run,
+            # so the second chain need not wait for its undo: the selectors change and the second
+            # chain starts as soon as e is known, and the trial unwinds beside it.
+            act = [i for i in range(w) if not ra <= i < rb]
+            lc, sc = C.alloc(len(act)), C.alloc(len(selectors))
+            trial = list(L)
+            for i, c in zip(act, lc):
+                C.cx(L[i], c)
+                trial[i] = c
+            for s_, c in zip(selectors, sc):
+                C.cx(s_, c)
+            first = wide.LowAdd(C, trial, sc, masks, self.run, M.top, WIDE_LOW)
+            carry_out = first.top
+        elif WIDE_LOW:
             first = wide.LowAdd(C, L, selectors, masks, self.run, M.top, WIDE_LOW)
             carry_out = first.top
         else:
@@ -1190,7 +1295,9 @@ class TwoBitMod(Mod):
             C.ccx(P.top, carry_out, e)
         else:
             C.cx(carry_out, e)
-        if WIDE_LOW:
+        if aside:
+            pass
+        elif WIDE_LOW:
             first.undo()
         else:
             self._chain_down(C, L, selectors, masks, M, {}, chain, drop, False)
@@ -1199,8 +1306,9 @@ class TwoBitMod(Mod):
         else:
             C.cx(b, one)
             C.cx(g0, one)
-        C.cx(sw, b)
-        self._end(C, g0, b, sw)
+        if not aside:
+            C.cx(sw, b)
+            self._end(C, g0, b, sw)
         C.ccx(three, e, k2)
         C.ccx(k0, k1, three)
         C.free([three])
@@ -1217,6 +1325,29 @@ class TwoBitMod(Mod):
         if WIDE_LOW:
             second = wide.LowAdd(C, L, selectors, masks, self.run, M.top, WIDE_LOW)
             carry_out = second.top
+            if aside:
+                first.undo()
+                one_c, k0_c, k1_c, three_c = sc
+                # The copies hold the old one, k0, k1 and k0 k1; k1 took k0 e and k0 took e since.
+                C.ccx(k0_c, k1_c, three_c)
+                C.cx(k1, k1_c)
+                C.ccx(k0_c, e, k1_c)
+                C.cx(k0, k0_c)
+                C.cx(e, k0_c)
+                if nxt is None:
+                    C.x(one_c)
+                else:
+                    C.cx(b, one_c)
+                    C.cx(g0, one_c)
+                C.free(sc)
+                # Until its write the second chain leaves L ^ K on each of these bits of L.
+                for i, c in zip(act, lc):
+                    C.cx(L[i], c)
+                    for s_ in second._on(i):
+                        C.cx(s_, c)
+                C.free(lc)
+                C.cx(sw, b)
+                self._end(C, g0, b, sw)
         else:
             perch = self._perches(selectors, masks)
             kept = self._kept_carries(perch)
@@ -1227,17 +1358,25 @@ class TwoBitMod(Mod):
                 kept = set(low_kept) | {self.run[0]}
             chain = self._chain_up(C, L, selectors, masks, M, perch, alloc, kept, moves)
             carry_out = chain[w]
-        if H:
-            C.ccx(P.top, carry_out, e)
+        if aside and isinstance(P, wide.PrefixTree):
+            # e = carry_out * AND(old H) is also carry_out * AND(~new H), which P's write holds
+            # before its last use of carry_out. Clearing e there keeps this CCX, and the trial's
+            # unwinding before it, out of the write's way.
+            P.write(carry_out, lambda z: (C.ccx(carry_out, z, e), drop(e)))
         else:
-            C.cx(carry_out, e)
-        drop(e)
-        P.write(carry_out)
+            if H:
+                C.ccx(P.top, carry_out, e)
+            else:
+                C.cx(carry_out, e)
+            drop(e)
+            P.write(carry_out)
         if idle and RESTORE_IDLE:
             # M's restore would take the wire chain[b]'s drop has just freed; take the one free first.
             M.alloc_restore = lambda: idle.alloc(1)[0]
-        if WIDE_LOW:
-            second.write(lambda c: (M.restore(), M.write(c)))
+        if WIDE_LOW and isinstance(M, wide.PrefixTree):
+            second.write(lambda c, mid: M.write(c, mid))
+        elif WIDE_LOW:
+            second.write(lambda c, mid: (mid(M.top), M.restore(), M.write(c)))
         else:
             self._chain_down(C, L, selectors, masks, M, perch, chain, drop, True, alloc)
         C.ccx(k0, k1, one)
@@ -1278,6 +1417,8 @@ class TwoBitMod(Mod):
             C.free([cin])
         mark_even(z)
         C.free([z])
+        if idle and WIDE_IDLE:
+            del C.alloc, C.alloc_after
         if p is not None:
             # S = R + k*f mod 4 names k's bit 1, which now sits on k2.
             def bit_one(m):
