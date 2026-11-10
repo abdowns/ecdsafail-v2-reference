@@ -133,6 +133,52 @@ def gt_tree(C, A, B, t, ctrl, block=4):
     C.free(taken[::-1])
 
 
+def gt_sweep(C, A, B, t, ctrl, spec):
+    """gt_tree's map, t ^= ctrl * [A > B], as one arith.CarrySweep that stops short of its fixes.
+
+    With B complemented, B ^= A and A's adjacent XORs put the carries of A + ~B in the sweep's
+    form, U[j + 1] ^= U[j] B[j] from a clean carry-in below A. Only the carry out is read, so
+    each block gives its local values and its product, the chain crosses the blocks once on the
+    way up, and the same gates backwards put everything back: no fix, and each product is made
+    and cleared once. spec is arith.carry_trees' (lo, hi, cap, fan, leaf)."""
+    from .arith import CarrySweep, _Gates, _emit, adjacent_xor, carry_trees
+    assert len(A) == len(B) >= 1 and ctrl not in (*A, *B, t)
+    A, B = list(A), list(B)
+    (cin,) = C.alloc(1)
+    taken = []
+
+    def take():
+        (w,) = C.alloc(1)
+        taken.append(w)
+        return w
+
+    wave = _Gates()
+    for a, b in zip(A, B):
+        wave.cx(a, b)
+    wave.cx(A[0], cin)
+    adjacent_xor(wave, A)
+    for x in B:
+        C.x(x)
+    _emit(C, wave.ops)
+    U = [cin] + A
+    sweep = CarrySweep(C, U, B, take, lambda w: None)
+    trees = carry_trees(len(A), spec)
+    for root in trees:
+        if root["kids"] is not None:
+            sweep.up(root)
+        C.ccx(U[root["s"]], sweep.beta(root), U[root["e"]])
+    C.ccx(ctrl, U[-1], t)
+    for root in reversed(trees):
+        C.ccx(U[root["s"]], sweep.beta(root), U[root["e"]])
+        if root["kids"] is not None:
+            sweep.unlocal(root)
+    _emit(C, reversed(wave.ops))
+    for x in B:
+        C.x(x)
+    C.free(taken[::-1])
+    C.free([cin])
+
+
 # The products write() rebuilds on the complemented bits serve only its carries and its hook: each
 # block's as a balanced tree, since no inner prefix is read, and none that neither reads.
 LEAN_REBUILD = True
