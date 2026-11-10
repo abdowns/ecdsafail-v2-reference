@@ -30,25 +30,45 @@ def _cx(C, ctrl, src, dst):
         C.ccx(ctrl, src, dst)
 
 
-def add(C, a, b, cout=None, ctrl=None):
-    """b += ctrl*a mod 2^w (CDKM). cout ^= ctrl*carry out."""
+def add(C, a, b, cout=None, ctrl=None, cin=None):
+    """b += ctrl*a mod 2^w (CDKM). cout ^= ctrl*carry out. A wire holding 1 as cin adds 1."""
     w = len(a)
     assert len(b) == w
     assert ctrl is None or ctrl not in (*a, *b, cout)
     if w == 0:
         return
-    (cin,) = C.alloc(1)
+    own = cin is None
+    if own:
+        (cin,) = C.alloc(1)
     carries = [cin] + a[:-1]
-    for i in range(w):
+    # Without a control the top bit needs no _maj/_uma pair. With no carry out they cancel to
+    # b ^= a ^ c; a carry out is cout ^= MAJ(a, b, c) = c ^ (a ^ c)(b ^ c), one CCX, and then
+    # b ^= a ^ c.
+    top = w - 1 if ctrl is None else w
+    for i in range(top):
         _maj(C, carries[i], b[i], a[i])
-    if cout is not None:
+    if top == w and cout is not None:
         _cx(C, ctrl, a[-1], cout)
-    for i in reversed(range(w)):
+    if top < w:
+        x, y, c = a[-1], b[-1], carries[-1]
+        if cout is None:
+            C.cx(x, y)
+            C.cx(c, y)
+        else:
+            C.cx(c, x)
+            C.cx(c, y)
+            C.ccx(x, y, cout)
+            C.cx(c, cout)
+            C.cx(x, y)
+            C.cx(c, y)
+            C.cx(c, x)
+    for i in reversed(range(top)):
         if ctrl is None:
             _uma(C, carries[i], b[i], a[i])
         else:
             _cuma(C, ctrl, carries[i], b[i], a[i])
-    C.free([cin])
+    if own:
+        C.free([cin])
 
 
 def sub(C, a, b, borrow=None, ctrl=None):
@@ -91,14 +111,18 @@ def load_const(C, reg, value, ctrl=None):
                 C.cx(ctrl, w)
 
 
-def _carry_into(C, b, bit, c, t, ctrl=None):
+def _carry_into(C, b, bit, c, t, ctrl=None, low=None):
     """t ^= MAJ(b, ctrl*bit, c), where c is a wire or None for 0. With ctrl, c
-    must imply ctrl, which holds for every carry of reg + ctrl*value."""
+    must imply ctrl, which holds for every carry of reg + ctrl*value. low(t), if
+    given, XORs ctrl*b into t, for the one b that meets the first set bit."""
     if not bit:
         if c is not None:
             C.ccx(b, c, t)
     elif c is None:
-        _cx(C, ctrl, b, t)
+        if low is None:
+            _cx(C, ctrl, b, t)
+        else:
+            low(t)
     elif ctrl is None:
         C.ccx(b, c, t)
         C.cx(b, t)
@@ -111,7 +135,7 @@ def _carry_into(C, b, bit, c, t, ctrl=None):
         C.cx(c, t)
 
 
-def _carries(C, reg, value, ctrl=None):
+def _carries(C, reg, value, ctrl=None, low=None):
     """cs[i] is the carry into reg[i] of reg + ctrl*value. Each entry is None
     when the carry is always 0, reg[i - 1] itself when it equals that bit, or a
     fresh wire. Release the fresh wires with _uncarry."""
@@ -124,27 +148,28 @@ def _carries(C, reg, value, ctrl=None):
             cs.append(reg[i])
         else:
             (t,) = C.alloc(1)
-            _carry_into(C, reg[i], bit, c, t, ctrl)
+            _carry_into(C, reg[i], bit, c, t, ctrl, low)
             cs.append(t)
     return cs
 
 
-def _uncarry(C, reg, value, cs, i, ctrl=None):
+def _uncarry(C, reg, value, cs, i, ctrl=None, low=None):
     """Clear and free cs[i]. reg[i - 1] and cs[i - 1] must still hold what they held in _carries."""
     if i and cs[i] is not None and cs[i] != reg[i - 1]:
-        _carry_into(C, reg[i - 1], value >> (i - 1) & 1, cs[i - 1], cs[i], ctrl)
+        _carry_into(C, reg[i - 1], value >> (i - 1) & 1, cs[i - 1], cs[i], ctrl, low)
         C.free([cs[i]])
 
 
-def add_const(C, reg, value, ctrl=None, cout=None):
+def add_const(C, reg, value, ctrl=None, cout=None, low=None):
     """reg += ctrl*value mod 2^w, cout ^= ctrl*carry out. The carry chain reads
-    the constant's bits, so 0 bits below the first 1 cost nothing."""
+    the constant's bits, so 0 bits below the first 1 cost nothing. low(t), if
+    given, XORs ctrl*reg[j] into t for the lowest set bit j of value."""
     w = len(reg)
     value %= 1 << w
     assert ctrl is None or ctrl not in (*reg, cout)
-    cs = _carries(C, reg, value, ctrl)
+    cs = _carries(C, reg, value, ctrl, low)
     if cout is not None:
-        _carry_into(C, reg[-1], value >> (w - 1) & 1, cs[-1], cout, ctrl)
+        _carry_into(C, reg[-1], value >> (w - 1) & 1, cs[-1], cout, ctrl, low)
     for i in reversed(range(w)):
         if value >> i & 1:
             if ctrl is None:
@@ -153,7 +178,7 @@ def add_const(C, reg, value, ctrl=None, cout=None):
                 C.cx(ctrl, reg[i])
         if cs[i] is not None:
             C.cx(cs[i], reg[i])
-        _uncarry(C, reg, value, cs, i, ctrl)
+        _uncarry(C, reg, value, cs, i, ctrl, low)
 
 
 def gt_const_into(C, value, b, t, ctrl=None):
@@ -196,12 +221,70 @@ def cswap(C, ctrl, a, b):
         C.cx(bi, ai)
 
 
+def _selected_carry(C, bit, selectors, masks, i, incoming, target):
+    """XOR a majority carry into target, restoring bit and the selectors.
+
+    The selected addend bit is an XOR of constant masks. Callers use exclusive
+    selectors, so that XOR is also the intended selected integer's bit.
+    """
+    active = [s for s, mask in zip(selectors, masks) if mask >> i & 1]
+    if not active:
+        if incoming is not None:
+            C.ccx(bit, incoming, target)
+        return
+    b = active[0]
+    for other in active[1:]:
+        C.cx(other, b)
+    if incoming is None:
+        C.ccx(bit, b, target)
+    else:
+        # MAJ(x,b,c) = c XOR ((x XOR c) AND (b XOR c)).
+        C.cx(incoming, bit)
+        C.cx(incoming, b)
+        C.ccx(bit, b, target)
+        C.cx(incoming, target)
+        C.cx(incoming, b)
+        C.cx(incoming, bit)
+    for other in reversed(active[1:]):
+        C.cx(other, b)
+
+
+def _selected_chain(C, low, selectors, masks):
+    carries = [None]
+    for i, bit in enumerate(low):
+        (carry,) = C.alloc(1)
+        _selected_carry(C, bit, selectors, masks, i, carries[-1], carry)
+        carries.append(carry)
+    return carries
+
+
+def _add_selected_const(C, b, selectors, masks):
+    """Add one of the constant masks under exclusive selectors, inline."""
+    n = len(b)
+    masks = [mask % (1 << n) for mask in masks]
+    start = min(((mask & -mask).bit_length() - 1 for mask in masks if mask), default=n)
+    low = b[start:]
+    shifted = [mask >> start for mask in masks]
+    chain = _selected_chain(C, low[:-1], selectors, shifted)
+    for i in reversed(range(len(low))):
+        if i + 1 < len(low):
+            # Clear the carry against the old bit, before writing the sum.
+            _selected_carry(C, low[i], selectors, shifted, i, chain[i], chain[i + 1])
+            C.free([chain[i + 1]])
+        for selector, mask in zip(selectors, shifted):
+            if mask >> i & 1:
+                C.cx(selector, low[i])
+        if chain[i] is not None:
+            C.cx(chain[i], low[i])
+
+
 class Mod:
     """Arithmetic modulo an odd q < 2^n on canonical values in [0, q)."""
 
     def __init__(self, q):
         self.q = q
         self.n = q.bit_length()
+        self.low_bits = (2 * ((1 << self.n) - q)).bit_length()
 
     def _wrap(self):
         """2^(n+1) - q, so s + _wrap() carries out of n + 1 bits exactly when s >= q."""
@@ -223,16 +306,109 @@ class Mod:
         _reduce(C, s, self._wrap() >> 1)
         s[:] = s[-1:] + s[:-1]
 
+    def dbl_add(self, C, ctrl, a, s, m=None):
+        """s = (2s + ctrl*a) mod q, canonical inputs, with clean scratch.
+
+        Like moddbl, rotate the output wire list right by one. The two quotient
+        bits are cleared by parity and a controlled comparison, respectively.
+        See DESIGN.md for the all-input reduction and cleanup argument.
+        """
+        n, q = self.n, self.q
+        m = self.low_bits if m is None else m
+        assert q >= 3 and q & 1 and self.low_bits <= m <= n
+        assert len(a) == len(s) == n and len(set([ctrl] + a + s)) == 2 * n + 1
+        f = (1 << n) - q
+        l0, top = C.alloc(2)
+        add(C, a[1:] + [l0], s, top, ctrl=ctrl)
+        C.ccx(ctrl, a[0], l0)
+        low = [l0] + s[:-1]
+        L, H = low[:m], low[m:]
+        # A[1] aliases H[0]; only A[2:] are owned scratch.
+        prefix = [None] + (H[:1] if H else [])
+        for bit in H[1:]:
+            (p,) = C.alloc(1)
+            C.ccx(prefix[-1], bit, p)
+            prefix.append(p)
+        k0, k1 = s[-1], top
+        C.x(k1)
+        C.cx(k0, k1)
+        selectors, masks = [k1, k0], [f, 2 * f]
+        chain = _selected_chain(C, L, selectors, masks)
+        (e,) = C.alloc(1)
+        if H:
+            C.ccx(prefix[-1], chain[-1], e)
+        else:
+            C.cx(chain[-1], e)
+        for i in reversed(range(m)):
+            _selected_carry(C, L[i], selectors, masks, i, chain[i], chain[i + 1])
+            C.free([chain[i + 1]])
+        C.cx(k0, k1)
+        C.x(k1)
+        C.ccx(k0, e, k1)
+        C.cx(e, k0)
+        selectors = [k0, k1]
+        chain = _selected_chain(C, L, selectors, masks)
+        if H:
+            C.ccx(prefix[-1], chain[-1], e)
+        else:
+            C.cx(chain[-1], e)
+        C.free([e])
+        for i in reversed(range(1, len(H))):
+            # Clear the prefix before overwriting the bit that computed it.
+            C.ccx(prefix[i], H[i], prefix[i + 1])
+            C.ccx(chain[-1], prefix[i], H[i])
+            C.free([prefix[i + 1]])
+        if H:
+            C.cx(chain[-1], H[0])
+        for i in reversed(range(m)):
+            _selected_carry(C, L[i], selectors, masks, i, chain[i], chain[i + 1])
+            C.free([chain[i + 1]])
+            if i:
+                for selector, mask in zip(selectors, masks):
+                    if mask >> i & 1:
+                        C.cx(selector, L[i])
+                C.cx(chain[i], L[i])
+        (z,) = C.alloc(1)
+        C.x(k0)
+        C.ccx(ctrl, k0, z)
+        C.x(k0)
+        gt_into(C, a[1:], low[1:], k1, ctrl=z)
+        C.x(k0)
+        C.ccx(ctrl, k0, z)
+        C.x(k0)
+        C.cx(l0, k0)
+        C.ccx(ctrl, a[0], l0)
+        C.free([l0, top, z])
+        s[:] = s[-1:] + s[:-1]
+
     def cmodadd_const(self, C, ctrl, value, b):
-        """b = (b + ctrl*value) mod q."""
+        """b = (b + ctrl*value) mod q on canonical b, with ctrl restored."""
         value %= self.q
         if value == 0:
             return
-        (top,) = C.alloc(1)
-        add_const(C, b, value, ctrl, top)
-        _reduce(C, b + [top], self._wrap())
-        gt_const_into(C, value, b, top, ctrl)
-        C.free([top])
+        (k,) = C.alloc(1)
+        gt_const_into(C, self.q - value, b, k, ctrl)
+        C.cx(ctrl, k)
+        C.cx(k, ctrl)
+        _add_selected_const(C, b, [ctrl, k], [value, value + (1 << self.n) - self.q])
+        C.cx(k, ctrl)
+        gt_const_into(C, value, b, k, ctrl)
+        C.free([k])
+
+    def creflect(self, C, ctrl, a, b):
+        """b = (a - b) mod q when ctrl, valid on all canonical b."""
+        a %= self.q
+        (k,) = C.alloc(1)
+        gt_const_into(C, a + 1, b, k, ctrl)
+        C.cx(ctrl, k)
+        for wire in b:
+            C.cx(ctrl, wire)
+        C.cx(k, ctrl)
+        _add_selected_const(C, b, [ctrl, k], [a + 1, (a + 1 + self.q) % (1 << self.n)])
+        C.cx(k, ctrl)
+        C.cx(ctrl, k)
+        gt_const_into(C, a + 1, b, k, ctrl)
+        C.free([k])
 
     def cneg(self, C, ctrl, b):
         """b = q - b when ctrl, valid for b in [1, q). A bijection on all of
