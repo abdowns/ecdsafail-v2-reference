@@ -243,6 +243,9 @@ EARLY_END = True
 # latest, the earliest free nearest sw. 0 keeps LATE_FINAL_WIRES's own choice. SWAP_SPREAD hands
 # neighbouring bits different copies, since a block's bits come free together.
 SWAP_COPIES = 256
+# k += e keeps k0 k1 on one wire: new k0 k1 = old k0 k1 ^ e * old k1, a single CCX where clearing
+# the old product and making the new one took two, in series with the rest of the update.
+K_SHORT = True
 SWAP_SPREAD = False
 
 
@@ -1350,9 +1353,16 @@ class TwoBitMod(Mod):
         if not aside:
             C.cx(sw, b)
             self._end(C, g0, b, sw)
+        short = K_SHORT and not aside
         C.ccx(three, e, k2)
-        C.ccx(k0, k1, three)
-        C.free([three])
+        if short:
+            # (k0 ^ e)(k1 ^ k0 e) = k0 k1 ^ e k1: three becomes the new k's product in place.
+            C.ccx(e, k1, three)
+            C.free([one])
+            one = three
+        else:
+            C.ccx(k0, k1, three)
+            C.free([three])
         C.ccx(k0, e, k1)
         C.cx(e, k0)
         if spare:
@@ -1361,7 +1371,8 @@ class TwoBitMod(Mod):
             C.ccx(P.top, u, e)
             C.free([e])
             e = u
-        C.ccx(k0, k1, one)
+        if not short:
+            C.ccx(k0, k1, one)
         selectors, masks = [one, k0, k1, k2], [self.corner, f, 2 * f, 4 * f]
         if WIDE_LOW:
             second = wide.LowAdd(C, L, selectors, masks, self.run, M.top, WIDE_LOW)
@@ -1399,7 +1410,7 @@ class TwoBitMod(Mod):
                 kept = set(low_kept) | {self.run[0]}
             chain = self._chain_up(C, L, selectors, masks, M, perch, alloc, kept, moves)
             carry_out = chain[w]
-        def high():
+        def high_write():
             if aside and isinstance(P, wide.PrefixTree):
                 # e = carry_out * AND(old H) is also carry_out * AND(~new H), which P's write holds
                 # before its last use of carry_out. Clearing e there keeps this CCX, and the trial's
@@ -1434,14 +1445,14 @@ class TwoBitMod(Mod):
                 made_m.extend(C.alloc(1))
                 bit_one(made_m[0])
         if not tail:
-            high()
+            high_write()
         if idle and RESTORE_IDLE:
             # M's restore would take the wire chain[b]'s drop has just freed; take the one free first.
             M.alloc_restore = lambda: idle.alloc(1)[0]
         if tail:
             # The run's write up to its hook reads nothing the high increment changes, so it goes
             # first; the hook's top falls wait for the increment's last read of carry_out.
-            second.write(lambda c, mid: M.write(c, lambda z: (high(), mid(z)), carries_first=True),
+            second.write(lambda c, mid: M.write(c, lambda z: (high_write(), mid(z)), carries_first=True),
                          aside=True, before_falls=held_bit)
         elif WIDE_LOW and isinstance(M, wide.PrefixTree):
             second.write(lambda c, mid: M.write(c, mid))
