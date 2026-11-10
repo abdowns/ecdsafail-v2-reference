@@ -207,7 +207,7 @@ RESTORE_IDLE = True
 # The tick's compare as wide.gt_tree on clean scratch, in blocks of this many bits (0 = compare_blocks).
 WIDE_CMP = (3, 4, 6)
 # The compare as wide.gt_sweep over arith.carry_trees' (lo, hi, cap, fan, leaf), or None for gt_tree.
-WIDE_CMP_SWEEP = None
+WIDE_CMP_SWEEP = (2, None, 128, 2, 2)
 # The tick's add in blocks of this many bits, each with its own temps (0 = LA_F_WIDE / LA_B_WIDE).
 WIDE_ADD = 7
 # The add's blocks ramp from 1 up to WIDE_ADD at both ends, each size this many times.
@@ -226,17 +226,17 @@ COPY_IDLE = True
 # each end up to cap bits, so a block's tree is as deep as the chain is late in reaching it; inside,
 # a block splits `fan` ways down to runs of `leaf` bits. A sweep of S blocks costs 4m - 3S CCX
 # whatever is inside them, and the chain pays its 7 (forward) or 11 (backward) ticks only S times.
-WIDE_ADD_TREE_F = (2.0, 1.5, 32, 2, 3)
+WIDE_ADD_TREE_F = (2.0, 2, 32, 2, 3)
 # The rotation's swaps read J from the sweeps' temps as well, which are clean by then.
 WIDE_ADD_ROT_TEMPS = True
-WIDE_ADD_TREE_B = (2, 2.5, 128, 2, 2)
+WIDE_ADD_TREE_B = (3, 2.5, 128, 2, 3)
 # The second wave too. Left serial, it follows the backward sweep down the word, and the rotation
 # starts on the middle bits meanwhile; as a network it waits for the sweep's last bit.
 WIDE_WAVE_BACK = True
 # The tick's P and M as wide.PrefixTree in blocks of this many bits (0 = PrefixR and Prefix). With
 # WIDE_P the first chain's carriers are clean wires, not borrowed H wires.
 WIDE_P = 4
-WIDE_M = 3
+WIDE_M = 4
 # The tick's two low chains as wide.LowAdd in blocks of this many bits (0 = _chain_up and _chain_down).
 WIDE_LOW = 3
 # Give every scratch wire from the prefixes to the compare by when it comes free under the tick model,

@@ -4,11 +4,13 @@ the tick's widths, and a mutation control.
     python3.12 -I -B scripts/wide_check.py <tree>
 
 gt_tree     t ^= ctrl * [A > B], with A, B and ctrl restored and the scratch clean.
+gt_sweep    the same map over arith.carry_trees' blocks.
 PrefixTree  .top = AND(bits). write(t, mid) leaves bits + t mod 2^h and t, cleans the scratch, and
             hands mid a wire z with t * z = t * AND(old bits).
 LowAdd      .top = the carry out of L + K, K the XOR of the selected masks. undo() restores every
             wire. write() leaves L[0] alone and adds K and its carries into L[1:], the quiet run
-            through a PrefixTree's write.
+            through a PrefixTree's write. The aside write also with its low carries cleared by a
+            tree sweep (wide.LOW_FALL_TREE).
 Control     one circuit per routine, each of its CCX turned into a CX in turn: the same check
             must fail.
 
@@ -24,12 +26,15 @@ from qec import sim, wide  # noqa: E402
 from qec.builder import CCX, CX, Circuit  # noqa: E402
 
 
-def gt_case(width, block, cases):
-    """cases: (A, B, ctrl, t)."""
+def gt_case(width, block, cases, sweep=None):
+    """cases: (A, B, ctrl, t). sweep: gt_sweep over that partition instead of gt_tree."""
     C = Circuit()
     A, B = C.alloc(width), C.alloc(width)
     z, t = C.alloc(2)
-    wide.gt_tree(C, A, B, t, z, block)
+    if sweep:
+        wide.gt_sweep(C, A, B, t, z, sweep)
+    else:
+        wide.gt_tree(C, A, B, t, z, block)
     init = {}
     for k, wires in enumerate((A, B, [z], [t])):
         init.update(sim.pack([c[k] for c in cases], wires))
@@ -74,10 +79,19 @@ def prefix_case(h, block, cases, hooked=True):
     return C, failing
 
 
-def low_case(w, quiet, masks, block, cases, write, aside=False):
+def low_case(w, quiet, masks, block, cases, write, aside=False, fall=None):
     """cases: (L, selector bits). aside: the write that falls against copies, its hook reading
-    L[1:a] as sums, and release() at the end."""
+    L[1:a] as sums, and release() at the end. fall: wide.LOW_FALL_TREE for this circuit."""
     a, b = quiet
+    saved, wide.LOW_FALL_TREE = wide.LOW_FALL_TREE, fall
+    try:
+        return _low_case(w, a, b, masks, block, cases, write, aside)
+    finally:
+        wide.LOW_FALL_TREE = saved
+
+
+def _low_case(w, a, b, masks, block, cases, write, aside):
+    quiet = (a, b)
     C = Circuit()
     L, sel = C.alloc(w), C.alloc(len(masks))
     (out,) = C.alloc(1)
@@ -161,6 +175,27 @@ for width in (33, 64, 221, 255, 256):
         fails += failing(C.ops)
 print(f"gt_tree: widths 33..256 on 800 drawn inputs each: failing {fails}")
 
+SWEEPS = ((2, None, 128, 2, 2), (1.6, 2, 4, 2, 2), (2, None, 3, 3, 2), (None, None, 2, 2, 1), (1.5, None, 300, 2, 3))
+count = 0
+for width in range(1, 8):
+    cases = [(x, y, z, t) for x in range(1 << width) for y in range(1 << width) for z in (0, 1) for t in (0, 1)]
+    for spec in SWEEPS:
+        C, failing = gt_case(width, None, cases, spec)
+        fails += failing(C.ops)
+        count += 1
+print(f"gt_sweep: {count} circuits on every input, widths 1..7: failing {fails}")
+for width in (33, 64, 221, 255, 256):
+    cases = []
+    for _ in range(400):
+        x = rng.getrandbits(width)
+        k = rng.randrange(width + 1)
+        y = x ^ (rng.getrandbits(k) if k else 0)
+        cases += [(x, y, rng.getrandbits(1), rng.getrandbits(1)), (y, x, 1, 0)]
+    for spec in SWEEPS:
+        C, failing = gt_case(width, None, cases, spec)
+        fails += failing(C.ops)
+print(f"gt_sweep: widths 33..256 on 800 drawn inputs each: failing {fails}")
+
 count = 0
 for h in range(1, 11):
     cases = [(v, c) for v in range(1 << h) for c in (0, 1)]
@@ -182,6 +217,8 @@ for h in (20, 33, 221, 222):
             fails += failing(C.ops)
 print(f"PrefixTree: h 20..222, the lowest 0 at every position: failing {fails}")
 
+FALLS = ((2, 2, 2, 2, 2), (None, 2, 8, 2, 2), (2, None, 16, 3, 2), (None, None, 16, 2, 1))
+MODES = [(False, False, None), (True, False, None), (True, True, None)] + [(True, True, f) for f in FALLS]
 count = 0
 for w in range(2, 9):
     for a in range(1, w + 1):
@@ -191,8 +228,8 @@ for w in range(2, 9):
                 masks = [rng.getrandbits(w) & ~run_bits | 1 for _ in range(rng.randrange(1, 4))]
                 cases = [(Lv, sv) for Lv in range(1 << w) for sv in range(1 << len(masks))]
                 for block in (1, 2, 3, 4, 8):
-                    for write, aside in ((False, False), (True, False), (True, True)):
-                        C, failing = low_case(w, (a, b), masks, block, cases, write, aside)
+                    for write, aside, fall in MODES:
+                        C, failing = low_case(w, (a, b), masks, block, cases, write, aside, fall)
                         fails += failing(C.ops)
                         count += 1
 print(f"LowAdd: {count} circuits on every input, w 2..8, every quiet run: failing {fails}")
@@ -207,8 +244,8 @@ for masks in ([f, f ^ 2 * f, f ^ 3 * f, corner ^ 4 * f], [corner, f, 2 * f, 4 * 
             Lv |= (1 << 32) - (1 << 12)                 # the quiet run all ones
         cases.append((Lv, rng.getrandbits(4)))
     for block in (1, 2, 3, 4, 6, 12):
-        for write, aside in ((False, False), (True, False), (True, True)):
-            C, failing = low_case(w, (12, 32), masks, block, cases, write, aside)
+        for write, aside, fall in MODES:
+            C, failing = low_case(w, (12, 32), masks, block, cases, write, aside, fall)
             fails += failing(C.ops)
 print(f"LowAdd: secp256k1's masks, w = {w}, quiet run 12..32, 600 drawn inputs: failing {fails}")
 
@@ -220,10 +257,12 @@ LOW_CASES = [(Lv, sv) for Lv in range(1 << 8) for sv in range(8)]
 cases = [(x, y, z, t) for x in range(1 << width) for y in range(1 << width) for z in (0, 1) for t in (0, 1)]
 for name, (C, failing) in (
         ("gt_tree", gt_case(width, (2, 3, 4, 5), cases)),
+        ("gt_sweep", gt_case(width, None, cases, (2, None, 128, 2, 2))),
         ("PrefixTree", prefix_case(9, 3, [(v, c) for v in range(1 << 9) for c in (0, 1)])),
         ("PrefixTree, no hook", prefix_case(9, 4, [(v, c) for v in range(1 << 9) for c in (0, 1)], False)),
         ("LowAdd write", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True)),
         ("LowAdd write aside", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True, True)),
+        ("LowAdd write aside, tree falls", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, True, True, (2, 2, 2, 2, 2))),
         ("LowAdd undo", low_case(8, (3, 5), LOW_MASKS, 3, LOW_CASES, False))):
     seen, total = mutants(C, failing)
     missed += total - seen

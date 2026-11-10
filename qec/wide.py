@@ -317,6 +317,11 @@ class PrefixTree:
         C.free(self.taken[::-1])
 
 
+# write(aside=True) clears the carries below the quiet run by arith.CarrySweep over carry_trees'
+# (lo, hi, cap, fan, leaf), or None for one fall a bit, 11 ticks each in series.
+LOW_FALL_TREE = (2, 2, 2, 2, 2)
+
+
 class LowAdd:
     """The carries of L + K, where K is the XOR of the masks whose selectors are set, and then
     either undo() or write(): L[1:] += K's carries and bits (bit 0 is left alone, as the tick's
@@ -480,15 +485,34 @@ class LowAdd:
             for s in self._on(i):
                 C.cx(s, t)
             C.x(t)
-        for i in reversed(range(self.a)):
-            if i in self.copies:
-                c, t = below(i), self.copies[i]
-                C.ccx(c, t, K[i])
-                C.cx(K[i], c)
-                C.x(t)
-                C.cx(K[i], t)
-            else:
-                fall(i)
+        if aside and LOW_FALL_TREE and self.a > 2:
+            # Each fall is K[i] ^= below(i) * P_i and then CXs out of K[i]; the rail below is read
+            # before those CXs reach it, and K[i] is only XORed into in between. So the CCXs are
+            # the carry sweep's inverse on the rails, which runs over trees, and the CXs follow in
+            # the falls' order.
+            from .arith import CarrySweep, carry_trees
+            rails = [below(0)] + [K[i] for i in range(self.a)]
+            P = [L[0]] + [self.copies[i] for i in range(1, self.a)]
+            sweep = CarrySweep(C, rails, P, lambda: C.alloc(1)[0], lambda t: C.free([t]))
+            for root in reversed(carry_trees(self.a, LOW_FALL_TREE)):
+                sweep.backward(root)
+            for i in reversed(range(self.a)):
+                C.cx(K[i], below(i))
+                if i in self.copies:
+                    C.x(self.copies[i])
+                    C.cx(K[i], self.copies[i])
+                else:
+                    C.cx(K[i], L[i])
+        else:
+            for i in reversed(range(self.a)):
+                if i in self.copies:
+                    c, t = below(i), self.copies[i]
+                    C.ccx(c, t, K[i])
+                    C.cx(K[i], c)
+                    C.x(t)
+                    C.cx(K[i], t)
+                else:
+                    fall(i)
         self.fan.play(C, reverse=True)
         self._free()
 
