@@ -244,7 +244,7 @@ WIDE_LOW = 3
 # ends, and handing it to a tree that could run beside it makes the second wait for the first.
 WIDE_IDLE = True
 # Run the trial chain on copies, beside the second chain.
-WIDE_ASIDE = False
+WIDE_ASIDE = True
 # The quiet run's write goes before the high increment, which then needs no wire the run's write
 # frees, and the low carries fall beside the compare.
 WIDE_TAIL = True
@@ -258,6 +258,10 @@ SWAP_COPIES = 256
 # k += e keeps k0 k1 on one wire: new k0 k1 = old k0 k1 ^ e * old k1, a single CCX where clearing
 # the old product and making the new one took two, in series with the rest of the update.
 K_SHORT = True
+# With the trial on copies: every bit of k += e one CCX after e (one CCX more a tick).
+K_FAST = True
+# A copy of the tick's lane bit for the second of its two swaps.
+ONE_COPY = False
 SWAP_SPREAD = False
 
 
@@ -1292,6 +1296,9 @@ class TwoBitMod(Mod):
             else:
                 for x in order:
                     C.cx(p, x)
+        # one is taken before the mark's wire is freed: on that wire it would wait for the mark's
+        # last CCX, which nothing after it reads.
+        one = C.alloc(2 if ONE_COPY and nxt is not None else 1)
         self._drop_after_b1(C, prev, p)
         (l0,) = [pout] if pout is not None else C.alloc(1)
         C.ccx(g0, a[0], l0)
@@ -1300,16 +1307,23 @@ class TwoBitMod(Mod):
         k0, k1, k2 = word[n - 1:n + 2]
 
         # one = 0 only on a B1, which is the tick's inert lane. b holds J here, so this needs no CCX.
-        (one,) = C.alloc(1)
+        one, one2 = one[0], one[1:]
         if nxt is None:
             C.x(one)
         else:
             C.cx(g0, one)
             C.cx(b, one)
             C.x(one)
+            # The two swaps read one each; on a copy the second does not wait for the first.
+            for c in one2:
+                C.cx(one, c)
+            o2 = one2[0] if one2 else one
             cswap(C, one, [k0], [l0])
-            C.cx(one, nxt)
-            cswap(C, one, [k1], [nxt])
+            C.cx(o2, nxt)
+            cswap(C, o2, [k1], [nxt])
+            for c in one2:
+                C.cx(one, c)
+            C.free(one2)
             C.x(one)
         ra, rb = self.run
         idle = _Idle(C, tick_start) if IDLE_WIRES else None
@@ -1395,8 +1409,32 @@ class TwoBitMod(Mod):
             C.cx(sw, b)
             self._end(C, g0, b, sw)
         short = K_SHORT and not aside
-        C.ccx(three, e, k2)
-        if short:
+        fast = K_FAST and aside and not spare
+        if fast:
+            # k += e with every new bit one CCX after e: k2 ^= k0 k1 e, and the two products the
+            # other bits need, e k1 and k0 e, on wires of their own from copies of e. three takes
+            # e k1 and is the new k0 k1 ((k0 ^ e)(k1 ^ k0 e) = k0 k1 ^ e k1). The two products are
+            # cleared from the new bits beside the second chain, before e goes.
+            ec = C.alloc(2)
+            ek1, k0e = C.alloc(2)
+            for c in ec:
+                C.cx(e, c)
+            C.ccx(three, e, k2)
+            C.ccx(ec[0], k1, ek1)
+            C.ccx(k0, ec[1], k0e)
+            for c in ec:
+                C.cx(e, c)
+            C.free(ec)
+            C.cx(ek1, three)
+            C.cx(k0e, k1)
+            C.cx(e, k0)
+            C.free([one])
+            one = three
+        else:
+            C.ccx(three, e, k2)
+        if fast:
+            pass
+        elif short:
             # (k0 ^ e)(k1 ^ k0 e) = k0 k1 ^ e k1: three becomes the new k's product in place.
             C.ccx(e, k1, three)
             C.free([one])
@@ -1404,15 +1442,16 @@ class TwoBitMod(Mod):
         else:
             C.ccx(k0, k1, three)
             C.free([three])
-        C.ccx(k0, e, k1)
-        C.cx(e, k0)
+        if not fast:
+            C.ccx(k0, e, k1)
+            C.cx(e, k0)
         if spare:
             u = take()
             C.cx(e, u)
             C.ccx(P.top, u, e)
             C.free([e])
             e = u
-        if not short:
+        if not short and not fast:
             C.ccx(k0, k1, one)
         selectors, masks = [one, k0, k1, k2], [self.corner, f, 2 * f, 4 * f]
         if WIDE_LOW:
@@ -1441,6 +1480,13 @@ class TwoBitMod(Mod):
                 C.free(lc)
                 C.cx(sw, b)
                 self._end(C, g0, b, sw)
+            if fast:
+                # k0 e = e ~(new k0), and e k1 = e (new k1) ^ k0 e.
+                C.cx(k0e, ek1)
+                C.ccx(e, k1, ek1)
+                C.cx(e, k0e)
+                C.ccx(k0, e, k0e)
+                C.free([ek1, k0e])
         else:
             perch = self._perches(selectors, masks)
             kept = self._kept_carries(perch)

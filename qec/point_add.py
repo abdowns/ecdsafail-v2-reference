@@ -314,6 +314,8 @@ def shared_difference_ripple(C, U, V, g0, g1, ring):
 
 # Hand each Bezout tick's B1 mark to the next tick when nothing runs between them.
 HAND_OFF_MARK = True
+# The mark also crosses a codec call between two ticks, which is on other cells.
+HAND_OFF_ACROSS = True
 
 # Run the Bezout pass's block codec calls on the free wires freed longest ago.
 CODEC_ASIDE = True
@@ -725,18 +727,34 @@ class DialogMultiplier:
         tail_encoded = False
 
         def quiet(i):
-            """Nothing is emitted between tick call i and tick call i - 1, which has a prev."""
+            """Tick call i can leave its cell's mark for tick call i - 1: that tick has a prev, and
+            nothing emitted between the two touches cell i. A block's encode, the tail's code and
+            the next block's decode work on other cells; the block-0 hold and the terminal cell's
+            release do not."""
             j = i - 1
             if not HAND_OFF_MARK or i == T - 1 or j < 0:
                 return False
+            hold = j == 1 and self.blocks
+            np = lend_tail and j == T - 2
+            if hold or np:
+                return False
+            if HAND_OFF_ACROSS:
+                return True
             enc = (i + 1) % TICKS == 0 and i + 1 < T and (i + 1) // TICKS < self.blocks
             tl = tail and i == T - tail_code.CELLS - 1
             dec = j % TICKS == 0 and 0 <= j // TICKS - 1 < self.blocks
-            hold = j == 1 and self.blocks
-            np = lend_tail and j == T - 2
-            return not (enc or tl or dec or hold or np)
+            return not (enc or tl or dec)
 
-        hand, mark_at = None, None
+        def untouched(since, wires):
+            """No primitive or call emitted since `since` is on any of `wires`."""
+            at, call = since
+            ops = C.prims[4 * at:]
+            used = set(ops[1::4]) | set(ops[2::4]) | set(ops[3::4])
+            for c in (C.calls or ())[call:]:
+                used.update(c.wires)
+            return not used & set(wires)
+
+        hand, mark_at, mark_cell = None, None, None
         for i in reversed(range(T)):
             nxt_block = i // TICKS - 1
             if i % TICKS == 0 and 0 <= nxt_block < self.blocks:
@@ -769,15 +787,16 @@ class DialogMultiplier:
             else:
                 consume, produce = hand is not None, quiet(i)
                 if consume:
-                    # The mark is valid only if nothing ran since the tick that made it.
-                    assert mark_at == (len(C.prims), len(C.calls or ())) and not first
+                    # The mark is NOR of the cell before, so it holds only while nothing since the
+                    # tick that made it has been on that cell or on the mark.
+                    assert not first and mark_cell == prev and untouched(mark_at, prev + [hand])
                 pin = [hand] if consume else []
                 pout = C.alloc(1) if produce else []
                 C.apply(self._bezout_tick(first, last, pebble, consume, produce),
                         [prev, G[2 * i:2 * i + 2], nxt, Yr, S, pin, pout])
                 C.free(pin)
                 hand = pout[0] if produce else None
-                mark_at = (len(C.prims), len(C.calls or ()))
+                mark_at, mark_cell = (len(C.prims), len(C.calls or ())), G[2 * i:2 * i + 2]
             prev_block = (i + 1) // TICKS
             if (i + 1) % TICKS == 0 and i + 1 < T and prev_block < self.blocks:
                 _aside(C, lambda: C.free(self._encode(G, prev_block, swept)))
