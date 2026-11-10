@@ -115,13 +115,7 @@ class Circuit:
             del self.calls[first_call:]
         self.free_stack, self.num_wires = saved_stack, saved_hw
         unflatten_into(regs, flat_in)
-        block = Block(ops, flat_in, flat_out, calls)
-        import sys as _sys
-        f = _sys._getframe(1)
-        if f.f_code.co_name in ("record_shape", "run"):
-            f = f.f_back
-        block.name = f"{getattr(fn, '__qualname__', type(fn).__name__)}@{f.f_code.co_name}:{f.f_lineno}"
-        return block
+        return Block(ops, flat_in, flat_out, calls)
 
     def apply(self, block, regs, inverse=False):
         src_live, dst_live = (block.flat_out, block.flat_in) if inverse else (block.flat_in, block.flat_out)
