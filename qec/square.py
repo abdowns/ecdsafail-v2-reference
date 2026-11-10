@@ -16,9 +16,14 @@ from .two_bit import Prefix
 
 
 def _keep_add(C, a, b, cout, K):
-    """b += a, cout ^= carry out, each inner carry left on a junk wire popped from K."""
+    """b += a, cout ^= carry out, each inner carry left on a junk wire popped from K. When K
+    runs out below the top, the bits above are a plain add whose carry in is the last kept
+    carry, which that add restores."""
     c = None
     for k, (x, y) in enumerate(zip(a, b)):
+        if k < len(a) - 1 and not K:
+            add(C, a[k:], b[k:], cout=cout, cin=c)
+            return
         t = cout if k == len(a) - 1 else K.pop(0)
         if c is None:
             C.ccx(x, y, t)
@@ -39,7 +44,8 @@ def _rows(C, Y, Q, copy=True, K=None):
     """Q = Y*(2^w - Y) on 2w clean wires, w = len(Y), or Y*(2^w - 1 - Y) without the copy.
     After row i, Q < 2^(w + i + 1), so each carry lands on a wire no earlier row reached; the
     uncopied sums are smaller. Y's wires walk through their Gray code. K, if given, is a list
-    of junk wires, and a row whose inner carries fit there keeps them, at one CCX a bit."""
+    of junk wires, and each row keeps as many of its inner carries there as K still has, at one
+    CCX a kept bit."""
     n = len(Y)
     if copy:
         for y, q in zip(Y, Q):
@@ -47,7 +53,7 @@ def _rows(C, Y, Q, copy=True, K=None):
     for i in range(n - 1):
         for w in Y[i + 1:]:
             C.cx(Y[i], w)
-        if K is not None and len(K) >= n - 2 - i:
+        if K and n - 2 - i > 0:
             _keep_add(C, Y[i + 1:], Q[2 * i + 1:n + i], Q[n + i], K)
         else:
             add(C, Y[i + 1:], Q[2 * i + 1:n + i], cout=Q[n + i])
@@ -73,6 +79,23 @@ def _change(C, a, b, sign=1, cin=None, signed=False):
         for p in pad:
             C.cx(a[-1], p)
     C.free(pad)
+
+
+class _Lend:
+    """Lends clean wires to the allocator for a stretch of the build and takes the same wires
+    back. Every allocation in the stretch is returned clean before it ends, so the lent wires
+    are clean and free again, and the scratch the stretch needs comes out of them first."""
+
+    def __init__(self, C, wires):
+        self.C, self.wires = C, list(wires)
+
+    def __enter__(self):
+        self.C.free(self.wires)
+
+    def __exit__(self, *exc):
+        stack = self.C.free_stack
+        for w in self.wires:
+            stack.remove(w)
 
 
 def karatsuba_junk(w, thr):
@@ -152,9 +175,10 @@ def signed_digits(v):
 
 
 class SquareFold:
-    KEEP = 0
-    def __init__(self, mod):
-        self.mod, self.n = mod, mod.n
+    def __init__(self, mod, keep=0):
+        """keep is the number of extra junk wires for row carries. Each one a row uses saves a
+        CCX in compute and another in its inverse."""
+        self.mod, self.n, self.KEEP = mod, mod.n, keep
         self.f = f = (1 << mod.n) - mod.q
         self.b, self.m = f.bit_length(), (f * f).bit_length()
         # The low digit is +1 whatever f is, so its carry in can hold Z's + 1.
@@ -243,8 +267,12 @@ class SquareFold:
         t, c, k = J[2 * n + b + m:self.fixed_junk]
         junk = list(J[self.fixed_junk:self.junk - self.KEEP])
         keep = list(J[self.junk - self.KEEP:]) if self.KEEP else None
-        _karatsuba(C, Y, lo + hi, junk, self.thr, "R", keep)
+        # E, T, t, c and k are clean until the fold, so the Karatsuba adds take their pads and
+        # constant-add carries from them.
+        with _Lend(C, E + T + [t, c, k]):
+            _karatsuba(C, Y, lo + hi, junk, self.thr, "R", keep)
         assert not junk
+        self.kept = self.KEEP - len(keep or ())
         # hi = Y - hi = ~(hi + ~Y), and lo = ~lo.
         for w in Y:
             C.x(w)
@@ -256,7 +284,8 @@ class SquareFold:
         (one,) = C.alloc(1)
         C.x(one)
         # hi is any n-bit D, and lo + E holds ~lo, below 2^n.
-        self._multiple(C, hi, lo + E, (1 << n) - 1, (1 << n) - 1, one)
+        with _Lend(C, T + [t, c, k]):
+            self._multiple(C, hi, lo + E, (1 << n) - 1, (1 << n) - 1, one)
         C.x(one)
         C.free([one])
         self._multiple(C, E, T, f)

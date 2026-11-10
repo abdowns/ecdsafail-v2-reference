@@ -19,8 +19,10 @@ class DialogMultiplier:
     # nothing between reads past, so the passes are the same maps on the same states.
     RAW_TAPE = True
 
-    def __init__(self, C, mod):
-        self.C, self.mod = C, mod
+    def __init__(self, C, mod, junk=0):
+        """junk is the number of wires the forward Euclid pass may leave set for its inverse to
+        clear. Each one it uses saves a CCX in the pass and another in the inverse."""
+        self.C, self.mod, self.junk = C, mod, junk
         q, n = mod.q, mod.n
         self.iters = tick_bound(q)
         self.widths = tick_widths(q, self.iters)
@@ -129,36 +131,58 @@ class DialogMultiplier:
                      [self._block_wires(G, j, swept)], inverse=True)
 
 
-    def _shared_difference(self, U, V, g0, g1, top=None):
+    def _shared_difference(self, U, V, g0, g1, top=None, junk=()):
         """Compare and form the even difference using one majority chain. With top set, bit w - 1
-        is done by _top_bit on the domain that mode names."""
+        is done by _top_bit on the domain that mode names.
+
+        junk is a list of clean wires. The carries out of bits 1..len(junk) are built there and
+        left there, so those bits keep a_i in place and need no restore: 3 CCX a bit instead
+        of 4. The junk is a function of this step's input, so the step's inverse clears it."""
         C = self.C
         (cin,) = C.alloc(1)
-        carries = [cin] + U[:-1]
+        chain = len(U) if top is None else len(U) - 1
+        kept = len(junk)
+        assert kept <= max(0, chain - 1)
+        # carries[i] is the wire that holds the carry into bit i while the chain is up.
+        carries = [cin, U[0]] + list(junk) + U[kept + 1:]
         for wire in V:
             C.x(wire)
-        chain = len(U) if top is None else len(U) - 1
         for i in range(chain):
             if i == 0:
                 C.cx(U[i], V[i])
                 C.cx(U[i], carries[i])
                 C.cx(V[i], U[i])
+            elif i <= kept:
+                # MAJ(a, b, c) = c ^ (a ^ c)(b ^ c) onto the junk wire, a and b restored.
+                c, t = carries[i], carries[i + 1]
+                C.cx(c, U[i])
+                C.cx(c, V[i])
+                C.ccx(U[i], V[i], t)
+                C.cx(c, t)
+                C.cx(c, V[i])
+                C.cx(c, U[i])
             else:
                 _maj(C, carries[i], V[i], U[i])
         if top is None:
-            C.ccx(g0, U[-1], g1)
+            C.ccx(g0, carries[chain], g1)
         else:
-            self._top_bit(C, top, g0, U[-1], V[-1], U[-2], g1)
+            self._top_bit(C, top, g0, U[-1], V[-1], carries[chain], g1)
         for i in reversed(range(chain)):
             # Restore a_i and select S_i while unwinding the carry chain.
             if i == 0:
                 C.cx(V[i], U[i])
                 C.cx(g0, V[i])
+                C.cx(U[i], carries[i])
+                C.cx(U[i], V[i])
+            elif i <= kept:
+                C.cx(carries[i], U[i])
+                C.ccx(g0, U[i], V[i])
+                C.cx(carries[i], U[i])
             else:
                 C.ccx(carries[i], V[i], U[i])
                 C.ccx(g0, carries[i], V[i])
-            C.cx(U[i], carries[i])
-            C.cx(U[i], V[i])
+                C.cx(U[i], carries[i])
+                C.cx(U[i], V[i])
             # S_i XOR c_i XOR 1 is a_i XOR v_i on the swap branch.
             C.cx(carries[i], V[i])
             C.x(V[i])
@@ -224,18 +248,20 @@ class DialogMultiplier:
         else:
             raise ValueError(mode)
 
-    def _euclid_step(self, w: int, top_clear: bool = False, narrow: bool = False, last: bool = False):
+    def _euclid_step(self, w: int, top_clear: bool = False, narrow: bool = False, last: bool = False,
+                     kept: int = 0, keep_two: bool = False):
         """top_clear: the tick before ran at the same width, so V is below 2^(w - 1) on entry
         and the second strip's last swap, of two zero bits, never fires.
         narrow: the next width is w - 1, so by E7 this step leaves U below 2^(w - 1).
         last: the pass's last tick, whose input reaches (U, V, E) = (1, 0, 0) by E3."""
         if last:
             top_clear = narrow = False
-        key = (w, top_clear, narrow, last)
+            assert not kept and not keep_two
+        key = (w, top_clear, narrow, last, kept, keep_two)
         if key not in self._euclid_steps:
             C = self.C
 
-            def step(U, V, E, cell):
+            def step(U, V, E, cell, J):
                 g0, b = cell
                 offset = E[0]
                 if last:
@@ -257,12 +283,13 @@ class DialogMultiplier:
                     top = "both" if top_clear and narrow else "top_clear" if top_clear else "narrow"
                 C.cx(offset, V[0])
                 C.cx(V[0], g0)
-                self._shared_difference(U[:w], V[:w], g0, b, top)
+                self._shared_difference(U[:w], V[:w], g0, b, top, J[:kept])
                 V[:] = V[1:] + V[:1]
                 # A subtract keeps its swap on E and moves the old offset to the cell.
                 cswap(C, g0, [offset], [b])
-                # A no-subtract tick strips a second bit when V + E is even.
-                (two,) = C.alloc(1)
+                # A no-subtract tick strips a second bit when V + E is even. With keep_two the
+                # flag stays on a junk wire for the step's inverse to clear.
+                (two,) = J[kept:] if keep_two else C.alloc(1)
                 C.cx(offset, V[0])
                 C.x(g0)
                 C.x(V[0])
@@ -274,13 +301,32 @@ class DialogMultiplier:
                 C.ccx(two, offset, V[0])
                 for i in range(w - 3 if top_clear else w - 2):
                     cswap(C, two, [V[i]], [V[i + 1]])
-                C.x(g0)
-                C.ccx(g0, b, two)
-                C.x(g0)
-                C.free([two])
+                if not keep_two:
+                    C.x(g0)
+                    C.ccx(g0, b, two)
+                    C.x(g0)
+                    C.free([two])
 
-            self._euclid_steps[key] = C.record_shape(step, [w, w, 1, 2])
+            self._euclid_steps[key] = C.record_shape(step, [w, w, 1, 2, kept + keep_two])
         return self._euclid_steps[key]
+
+    @staticmethod
+    def step_carries(w, top_clear, narrow):
+        """Carries a step of width w can keep: those out of bits 1 to chain - 1."""
+        chain = w - 1 if w >= 2 and (top_clear or narrow) else w
+        return max(0, chain - 1)
+
+    @property
+    def junk_capacity(self):
+        """Junk wires a pass can use: every step but the first and the last, its carries and its
+        second-strip flag. The first step may be _euclid_tick0, which keeps none."""
+        total = 0
+        for i in range(1, self.iters - 1):
+            w = self.widths[i]
+            top_clear = w >= 3 and self.widths[i - 1] == w
+            narrow = self.widths[i + 1] == w - 1
+            total += self.step_carries(w, top_clear, narrow) + 1
+        return total
 
     def _euclid_tick0(self):
         """First Euclid step on U=q, E=0, using unwritten tape for carries."""
@@ -325,12 +371,13 @@ class DialogMultiplier:
             self._euclid_tick0_block = C.record_shape(step, [n, n, 1, 2, k])
         return self._euclid_tick0_block
 
-    def _euclid_pass(self, U: list[int], pool: list[int], block0_raw: bool = False) -> None:
+    def _euclid_pass(self, U: list[int], pool: list[int], block0_raw: bool = False, junk=()) -> None:
         # The pool starts as V plus clean external tape. It ends as the zero wires U did not
         # take back, then tape; U ends as its low wires and those zero wires. The boundary is a
         # permutation of U and the pool together.
         n = self.mod.n
         V, available, G = pool[:n], pool[n:], []
+        junk = list(junk)
         lend = U[n - self.u_lent:]
         E = self.C.alloc(1)
         f1 = (1 << n) - self.mod.q + 1
@@ -348,7 +395,13 @@ class DialogMultiplier:
                 # E7: the next tick's U fits its width. E3: the last tick ends at (1, 0, 0).
                 last = i == self.iters - 1
                 narrow = not last and self.widths[i + 1] == w - 1
-                self.C.apply(self._euclid_step(w, top_clear, narrow, last), [U[:w], V, E, cell])
+                # The steps take junk wires in order: a step's carries first, then its flag.
+                plain = last or i == 0
+                kept = 0 if plain else min(len(junk), self.step_carries(w, top_clear, narrow))
+                keep_two = not plain and len(junk) > kept
+                J, junk = junk[:kept + keep_two], junk[kept + keep_two:]
+                self.C.apply(self._euclid_step(w, top_clear, narrow, last, kept, keep_two),
+                             [U[:w], V, E, cell, J])
             G.extend(cell)
             next_width = self.widths[i + 1] if i + 1 < self.iters else self.pass_tail_width
             assert w - 1 <= next_width <= w
@@ -357,7 +410,7 @@ class DialogMultiplier:
             # By L6, u < 2**next_width from here on, and later steps touch only U[:w] for
             # w <= next_width, so U's wires from next_width up are zero for the rest of the pass.
             available.extend(reversed([u for u in U[next_width:w] if u in lend]))
-        assert len(V) == self.pass_tail_width and not available
+        assert len(V) == self.pass_tail_width and not available and not junk
         # Sweep down, coding each block as it finishes. The offset sweep leaves b on a
         # no-subtract tick alone. On the merged path the B1 sweep follows one cell behind it,
         # so a block is coded only after the B1 step that reads its bottom cell.
@@ -552,7 +605,9 @@ class DialogMultiplier:
         # On the merged path block 0 stays decoded from Bezout's end into the inverse pass, so
         # the pass is recorded without its last encode, which runs here instead.
         raw0 = self.swept and self.blocks > 0
-        E = C.run(lambda U, pool: self._euclid_pass(U, pool, raw0), [U, pool])
+        # Junk wires the forward pass fills and the inverse pass clears. Nothing between reads them.
+        junk = C.alloc(min(self.junk, self.junk_capacity))
+        E = C.run(lambda U, pool, J: self._euclid_pass(U, pool, raw0, J), [U, pool, junk])
         if raw0:
             self._code_block0(U, pool)
         lent = self.lent_after_pass
@@ -578,7 +633,8 @@ class DialogMultiplier:
             C.free([reg[i] for reg, i in places])
             for (reg, i), w in zip(places, raw):
                 reg[i] = w
-        C.apply(E, [Yr, pool], inverse=True)
+        C.apply(E, [Yr, pool, junk], inverse=True)
+        C.free(junk)
         load_const(C, Yr, q)
         Xr[:] = pool[:n]
         C.free(Yr + pool[n:])
@@ -617,11 +673,16 @@ def encode(P, n):
 
 
 class ControlledPointAdd:
+    # The wire budget, 4,096 at n = 256. Wires under it that the plain circuit leaves unused
+    # hold junk: Euclid carries across the Bezout pass, and square row carries across the modadd.
+    WIRES_PER_BIT = 16
+
     def __init__(self, curve: Curve, A):
         assert A is not None and curve.on_curve(A)
         self.curve, self.A = curve, A
         self.mod = Mod(curve.q)
         self.n = self.mod.n
+        self.junk, self.keep = self._junk_budgets()
         neg = curve.neg
         twoA = curve.add(A, A)
         # (exceptional input, its sum with A); the generic kernel divides by zero on these.
@@ -629,6 +690,36 @@ class ControlledPointAdd:
         enc = [encode(e, self.n) for e, _ in self.exceptions]
         assert len(set(enc)) == 4, "addend order must exceed 3"
         self._square_blk = None
+
+    def _junk_budgets(self):
+        """(Euclid junk wires per pass, square row-carry wires) that fit under the wire budget.
+
+        Each stage is built alone with no junk to find its own peak. Around M the control and
+        two flag wires are also live; around the square-subtract the control and two flags are,
+        beside the gen wire the stage itself is given."""
+        n, mod = self.n, self.mod
+        cap, around = self.WIRES_PER_BIT * n, 3
+        C = Circuit()
+        M = DialogMultiplier(C, mod)
+        M.apply(C.alloc(n), C.alloc(n))
+        junk = max(0, min(cap - around - C.num_wires, M.junk_capacity))
+        if not SquareFold.applies(mod.q):
+            return junk, 0
+        keep = 0
+        for attempt in range(2):
+            # First with no keep, for the peak; then with the room left, for the wires rows use.
+            saved = self.__dict__.copy()
+            self.C, self.keep, self._square_blk, self._modadd_blk = Circuit(), keep, None, None
+            (gen,) = self.C.alloc(1)
+            self._square_mulsub(gen, self.C.alloc(n), self.C.alloc(n))
+            wires, used = self.C.num_wires, self._square_fold.kept
+            self.__dict__.clear()
+            self.__dict__.update(saved)
+            if attempt == 0:
+                keep = max(0, cap - around - wires)
+            else:
+                keep = used
+        return junk, keep
 
     def _mulsub(self, gen, Yr, Xr):
         """X = X - gen * Y^2 mod q, Y untouched."""
@@ -658,10 +749,11 @@ class ControlledPointAdd:
     def _square_mulsub(self, gen, Yr, Xr):
         C, mod, n = self.C, self.mod, self.n
         if self._square_blk is None:
-            fold = SquareFold(mod)
+            fold = SquareFold(mod, self.keep)
             self._square_blk = C.record_shape(lambda y, j: fold.compute(C, y, j), [n, fold.junk])
             self._modadd_blk = C.record_shape(lambda k, a, b: fold.modadd(C, a, b, k[0]), [1, n, n])
             self._square_junk = fold.junk
+            self._square_fold = fold
         J = C.alloc(self._square_junk)
         C.apply(self._square_blk, [Yr, J])
         C.apply(self._modadd_blk, [[gen], J[:n], Xr], inverse=True)
@@ -774,7 +866,7 @@ class ControlledPointAdd:
         (c,) = C.alloc(1)
         Xr, Yr = C.alloc(n), C.alloc(n)
         declared = Xr + Yr
-        self.M = DialogMultiplier(C, self.mod)
+        self.M = DialogMultiplier(C, self.mod, self.junk)
         self._modadd_blk = self._square_blk = None
 
         flags = C.alloc(4)
