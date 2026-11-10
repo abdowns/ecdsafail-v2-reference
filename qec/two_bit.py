@@ -21,6 +21,7 @@ hold H's two top bits between the ticks, and nothing clean is held across them.
 from functools import lru_cache
 import heapq
 
+from . import wide
 from .arith import Mod, _maj, _selected_carry, cswap, gt_into
 
 
@@ -193,7 +194,7 @@ HIGH_CARRIERS = True
 LATE_FINAL_WIRES = True
 LATE_MIN_COPIES = 6
 # Copies of p for un-copying it from the word after the add (1 = none).
-P_FAN = 1
+P_FAN = 8
 # Run the tick's add as 2elliot depth/v2's CDKM ripple instead of either add above: 579,096
 # fewer CCX on the whole circuit for 1,535,700 more ticks (measured after the post-pass).
 CDKM_ADD = False
@@ -202,6 +203,17 @@ CDKM_ADD = False
 IDLE_WIRES = True
 # M's restored top too, instead of the carrier the second chain has just dropped.
 RESTORE_IDLE = True
+# The tick's compare as wide.gt_tree on clean scratch, in blocks of this many bits (0 = compare_blocks).
+WIDE_CMP = 4
+# The tick's add in blocks of this many bits, each with its own temps (0 = LA_F_WIDE / LA_B_WIDE).
+WIDE_ADD = 6
+WIDE_ADD_COPIES = 16
+# The tick's P and M as wide.PrefixTree in blocks of this many bits (0 = PrefixR and Prefix). With
+# WIDE_P the first chain's carriers are clean wires, not borrowed H wires.
+WIDE_P = 4
+WIDE_M = 4
+# The tick's two low chains as wide.LowAdd in blocks of this many bits (0 = _chain_up and _chain_down).
+WIDE_LOW = 4
 
 
 class _Idle:
@@ -1000,6 +1012,12 @@ class TwoBitMod(Mod):
         """Off J add a >> 1; on J rotate word's low n+1 bits left."""
         if CDKM_ADD and self.n > 3:
             return add_or_shift_cdkm(C, J, a, word, self.n)
+        if WIDE_ADD and self.n > 3:
+            m = self.n - 1
+            sizes = [1] + [WIDE_ADD] * ((m - 2) // WIDE_ADD) + [1] * ((m - 2) % WIDE_ADD) + [1]
+            temps = (WIDE_ADD - 1) * ((m - 2) // WIDE_ADD)
+            return add_or_shift_la(C, J, a, word, self.n, ntemps=max(temps, 1), ncopies=WIDE_ADD_COPIES,
+                                   fsizes=sizes, bsizes=sizes)
         if LOOKAHEAD_ADD and self.n > 3:
             fsizes = _la_wide(self.n - 1, *LA_F_WIDE) if LA_F_WIDE else None
             bsizes = _la_wide(self.n - 1, *LA_B_WIDE) if LA_B_WIDE else None
@@ -1123,18 +1141,20 @@ class TwoBitMod(Mod):
         idle = _Idle(C, tick_start) if IDLE_WIRES else None
         if idle:
             C.alloc = idle.alloc
-        if PARALLEL_PREFIX and len(H) > 1:
+        if WIDE_P and len(H) > 1:
+            P = wide.PrefixTree(C, H, WIDE_P)
+        elif PARALLEL_PREFIX and len(H) > 1:
             P = PrefixR(C, H, sizes=list(P_SIZES_221) if len(H) == 221 else sizes_for(len(H)))
         else:
             P = Prefix(C, H, cap=37)
-        M = Prefix(C, L[ra:rb])
+        M = wide.PrefixTree(C, L[ra:rb], WIDE_M) if WIDE_M and rb - ra > 1 else Prefix(C, L[ra:rb])
         if idle:
             del C.alloc
         # Only M's skip reads M before its write, so the top below its last is cleared until then.
         M.release()
 
         # With at most one H bit, P reads a data wire or nothing, and there is nothing to borrow.
-        spare = H[:] if len(H) > 1 else []
+        spare = H[:] if len(H) > 1 and not WIDE_P else []
 
         def alloc():
             (c,) = C.alloc(1)
@@ -1159,13 +1179,21 @@ class TwoBitMod(Mod):
         C.ccx(k0, k1, three)
         selectors = [one, k0, k1, three]
         masks = [f, f ^ 2 * f, f ^ 3 * f, self.corner ^ 4 * f]
-        chain = self._chain_up(C, L, selectors, masks, M, {}, take)
+        if WIDE_LOW:
+            first = wide.LowAdd(C, L, selectors, masks, self.run, M.top, WIDE_LOW)
+            carry_out = first.top
+        else:
+            chain = self._chain_up(C, L, selectors, masks, M, {}, take)
+            carry_out = chain[w]
         (e,) = C.alloc(1)
         if H:
-            C.ccx(P.top, chain[w], e)
+            C.ccx(P.top, carry_out, e)
         else:
-            C.cx(chain[w], e)
-        self._chain_down(C, L, selectors, masks, M, {}, chain, drop, False)
+            C.cx(carry_out, e)
+        if WIDE_LOW:
+            first.undo()
+        else:
+            self._chain_down(C, L, selectors, masks, M, {}, chain, drop, False)
         if nxt is None:
             C.x(one)
         else:
@@ -1186,24 +1214,32 @@ class TwoBitMod(Mod):
             e = u
         C.ccx(k0, k1, one)
         selectors, masks = [one, k0, k1, k2], [self.corner, f, 2 * f, 4 * f]
-        perch = self._perches(selectors, masks)
-        kept = self._kept_carries(perch)
-        schedule = self._pebble_schedule(perch) if pebble else None
-        moves = None
-        if schedule is not None:
-            moves, low_kept = schedule
-            kept = set(low_kept) | {self.run[0]}
-        chain = self._chain_up(C, L, selectors, masks, M, perch, alloc, kept, moves)
-        if H:
-            C.ccx(P.top, chain[w], e)
+        if WIDE_LOW:
+            second = wide.LowAdd(C, L, selectors, masks, self.run, M.top, WIDE_LOW)
+            carry_out = second.top
         else:
-            C.cx(chain[w], e)
+            perch = self._perches(selectors, masks)
+            kept = self._kept_carries(perch)
+            schedule = self._pebble_schedule(perch) if pebble else None
+            moves = None
+            if schedule is not None:
+                moves, low_kept = schedule
+                kept = set(low_kept) | {self.run[0]}
+            chain = self._chain_up(C, L, selectors, masks, M, perch, alloc, kept, moves)
+            carry_out = chain[w]
+        if H:
+            C.ccx(P.top, carry_out, e)
+        else:
+            C.cx(carry_out, e)
         drop(e)
-        P.write(chain[w])
+        P.write(carry_out)
         if idle and RESTORE_IDLE:
             # M's restore would take the wire chain[b]'s drop has just freed; take the one free first.
             M.alloc_restore = lambda: idle.alloc(1)[0]
-        self._chain_down(C, L, selectors, masks, M, perch, chain, drop, True, alloc)
+        if WIDE_LOW:
+            second.write(lambda c: (M.restore(), M.write(c)))
+        else:
+            self._chain_down(C, L, selectors, masks, M, perch, chain, drop, True, alloc)
         C.ccx(k0, k1, one)
         C.free([one])
 
@@ -1223,7 +1259,9 @@ class TwoBitMod(Mod):
         # Carry-select blocks borrow only clean wires already touched by this tick.
         cmp_a, cmp_b = a[1:], low[1:]
         width = len(cmp_a)
-        if width:
+        if width and WIDE_CMP:
+            wide.gt_tree(C, cmp_a, cmp_b, k1, z, WIDE_CMP)
+        elif width:
             (cin,) = C.alloc(1)
             # Each wire's last op in this tick so far: the compare hands the top block the wires that
             # came free first. Touched free wires read 0.

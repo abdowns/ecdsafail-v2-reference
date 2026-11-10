@@ -94,7 +94,7 @@ def write_circuit(fh, C, layout, depth_pass=True):
             total += _write_list(fh, _instr_chunks(ops, body_calls, ids, local))
             total += fh.write("}")
         total += fh.write("],")
-        counts = {"definitions": len(ids), "call_sites": len(calls) + sum(len(c) for _, c in bodies.values()),
+        counts = {"names": [getattr(b, "name", "?") for b in order], "definitions": len(ids), "call_sites": len(calls) + sum(len(c) for _, c in bodies.values()),
                   "primitive_ops": (len(top) + sum(len(o) for o, _ in bodies.values())) // 4}
     total += fh.write('"operations":')
     total += _write_list(fh, _instr_chunks(top, calls, ids))
