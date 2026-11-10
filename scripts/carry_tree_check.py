@@ -14,6 +14,9 @@
    scratch 0.
 4. The Euclid step with tree sweeps at w = 9 .. wmax (the ripple fallback switched off), on every
    input of the step's domain, against the same step with the Brent-Kung sweep.
+5. The Euclid step with its strip bit made before the difference, the select bits' copies on wires
+   outside the ring and a partition of its own, against the step with none of these and against
+   the ripple step, on every input of the step's domain.
 Each part has a mutation control: every CCX of a representative circuit turned into a CX, in turn,
 must make the part fail. Exits 1 on any failure, or on a mutant that passes.
 """
@@ -254,16 +257,23 @@ two_bit.WIDE_WAVE, two_bit.WIDE_WAVE_BACK = saved
 
 
 # 4. The Euclid step with tree sweeps against the Brent-Kung sweep, on the step's whole domain.
-def step_case(w, geo):
-    saved = arith.SWEEP_GEO, point_add.RIPPLE_MAX_W
-    arith.SWEEP_GEO, point_add.RIPPLE_MAX_W = geo, 0
+def step_case(w, geo, ring=None, **flags):
+    """flags: point_add settings for this build (the early strip bit, the select copies on free
+    wires, the per-width partitions); the defaults turn all three off."""
+    flags = {"TWO_EARLY": 0, "STEP_FREE": 0, "EUCLID_GEO": {}, "RIPPLE_MAX_W": 0, **flags}
+    saved = arith.SWEEP_GEO, {name: getattr(point_add, name) for name in flags}
+    arith.SWEEP_GEO = geo
+    for name, value in flags.items():
+        setattr(point_add, name, value)
     q = next(p for p in (251, 509, 1021, 2039, 4093, 8191) if p.bit_length() >= w)
     C = Circuit()
     m = point_add.DialogMultiplier(C, Mod(q))
-    k = 2 * w
+    k = 2 * w if ring is None else ring
     U, V, E, cell, ring = C.alloc(w), C.alloc(w), C.alloc(1), C.alloc(2), C.alloc(k)
     C.apply(m._euclid_step(w, k), [U, V, E, cell, ring])
-    arith.SWEEP_GEO, point_add.RIPPLE_MAX_W = saved
+    arith.SWEEP_GEO = saved[0]
+    for name, value in saved[1].items():
+        setattr(point_add, name, value)
     free = U[1:] + V + E
     N = len(free)
     init = {x: lane_mask(i, N) for i, x in enumerate(free)}
@@ -293,6 +303,39 @@ ok &= part
 # The domain fixes U[0] = 1 and ties the cell's wires, so a few CCXs are CXs on every lane of it.
 control(f"Euclid step w={WMAX} with tree sweeps, a sample", list(C1.ops), passes, sample=60,
         skip=always_on(C1.ops, C1.num_wires, init, 1 << N))
+
+
+
+# 5. The step with its strip bit made before the difference, a copy of each select bit a bit on
+# wires outside the ring, and a partition of its own, against the step with none of them and
+# against the ripple step, on the step's whole domain. The ring is the pass's size, w - 2.
+part = True
+for w in range(9, WMAX + 1):
+    C0, init, N, io = step_case(w, None, ring=w - 2)
+    want = sim.run(C0.ops, C0.num_wires, init, 1 << N)
+    Cr, initr, _, ior = step_case(w, None, ring=w - 2, RIPPLE_MAX_W=12)
+    wantr = sim.run(Cr.ops, Cr.num_wires, initr, 1 << N)
+    assert ior == io and initr == init and Cr.ops != C0.ops
+    part &= [wantr[x] for x in io] == [want[x] for x in io]
+    for flags in ({"TWO_EARLY": 128, "STEP_FREE": 12}, {"TWO_EARLY": 128, "STEP_FREE": 6, "TWO_ALTERNATE": False, "TWO_SPLIT": True},
+                  {"STEP_FREE": 270},
+                  {"EUCLID_GEO": {w: (2, 3, 4, 2, 2)}}, {"TWO_EARLY": 2, "STEP_FREE": 270, "EUCLID_GEO": {w: (2, 4, 2, 2, 2)}},
+                  {"TWO_EARLY": 128, "STEP_FREE": 270, "EUCLID_GEO": {w: (2, 3, 8, 2, 2)}}):
+        C1, init1, _, io1 = step_case(w, arith.SWEEP_GEO, ring=w - 2, **flags)
+        assert io1 == io and init1 == init
+
+        def passes(ops, C1=C1):
+            st = sim.run(ops, C1.num_wires, init, 1 << N)
+            return ([st[x] for x in io] == [want[x] for x in io]
+                    and all(st[x] == 0 for x in range(C1.num_wires) if x not in set(io)))
+
+        good = passes(C1.ops) and C1.ops != C0.ops
+        part &= good
+        print(f"5. Euclid step w={w} with {flags}: lanes 2^{N}, wires {C0.num_wires} -> {C1.num_wires}: "
+              f"{'ok' if good else 'FAIL'}", flush=True)
+ok &= part
+control(f"Euclid step w={WMAX} with the early strip bit and the select copies, a sample", list(C1.ops), passes,
+        sample=80, skip=always_on(C1.ops, C1.num_wires, init, 1 << N))
 
 print("carry_tree_check:", "ok" if ok else "FAIL")
 sys.exit(0 if ok else 1)

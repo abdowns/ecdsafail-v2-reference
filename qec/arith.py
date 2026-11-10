@@ -438,13 +438,15 @@ def lookahead_geo(C, U, V, temps, spec):
 SWEEP_BLOCKS = (1, 2, 3, 4, 5, 6, 8)
 
 
-def lookahead_sweep(C, U, V, temps):
-    """lookahead_chain's map (f_j = x_j ^ p_j f_(j-1) in place on U from U[0]): lookahead_tree with
-    the first block size in SWEEP_BLOCKS whose tree_temps fits len(temps), else lookahead_chain with
-    lookahead_sizes. Larger blocks need fewer temps and are slower."""
+def lookahead_sweep(C, U, V, temps, spec=None):
+    """lookahead_chain's map (f_j = x_j ^ p_j f_(j-1) in place on U from U[0]): carry_trees' blocks
+    for spec, or for SWEEP_GEO's spec at this length; else lookahead_tree with the first block size
+    in SWEEP_BLOCKS whose tree_temps fits len(temps), else lookahead_chain with lookahead_sizes.
+    Larger blocks need fewer temps and are slower."""
     n = len(U)
-    if _geo_spec(n):
-        lookahead_geo(C, U, V, temps, _geo_spec(n))
+    spec = spec or _geo_spec(n)
+    if spec:
+        lookahead_geo(C, U, V, temps, spec)
         return
     for r in SWEEP_BLOCKS:
         if tree_temps(n, r) <= len(temps):

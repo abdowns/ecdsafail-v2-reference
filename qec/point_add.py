@@ -40,13 +40,15 @@ def _unfanout(C, src, copies):
     for h, t in reversed(rec):
         C.cx(h, t)
 
-def _par_rotate(C, two, V, cp):
-    """Rotate V left by one under `two`: reverse V[0..L-1], then reverse V[0..L-2]."""
+def _par_rotate(C, two, V, cp, fanned=False):
+    """Rotate V left by one under `two`: reverse V[0..L-1], then reverse V[0..L-2]. fanned: cp
+    already holds two's copies; they are cleared here either way."""
     L = len(V)
     # With fewer clean wires than L // 2 - 1, the copies are shared round-robin; the rotation is
     # the same permutation, only less parallel.
     ctl = [two] + cp
-    _fanout(C, two, cp)
+    if not fanned:
+        _fanout(C, two, cp)
     for p in range(L // 2):
         cswap(C, ctl[p % len(ctl)], [V[p]], [V[L - 1 - p]])
     for p in range((L - 1) // 2):
@@ -162,6 +164,104 @@ TICK0_COPIES = 31
 # of a full ring take 42 at most, and the pass runs further than that below the circuit's peak, so
 # they cost no wire.
 RING_BORROW = 300
+# The Euclid step makes its second-strip bit and up to this many copies of it before its shared
+# difference, on wires outside the ring (0 = after it, on the ring). The pass leaves about 275
+# wires free under the circuit's width.
+TWO_EARLY = 128
+# Wires a Euclid step may take outside its ring. Through the Euclid pass at least 275 wires are
+# free under the circuit's width, which the Bezout ticks set.
+STEP_FREE = 270
+# Two steps in a row take that bit and its copies from different wires.
+TWO_ALTERNATE = True
+# The early strip bit from two CCX that only read V[1] (one CCX more a step).
+TWO_SPLIT = False
+
+
+# Sweep partition (arith.carry_trees spec) for the Euclid step at each width where one beats
+# arith.SWEEP_GEO's on the emitted, chained step, both directions (0.3 ticks charged a CCX).
+_EUCLID_GEO = {
+    (2, 4, 32, 2, 2): (
+        80, 81, 82, 83, 84, 85, 97, 98, 99, 115, 130, 133, 141, 142, 145, 146, 148, 149, 177
+    ),
+    (2, 2, 16, 2, 2): (
+        69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 88, 89, 91, 92
+    ),
+    (2, 3, 64, 2, 2): (
+        160, 161, 162, 163, 164, 165, 166, 224, 225, 226, 227, 228, 229, 230, 256
+    ),
+    (2, 2, 8, 2, 2): (
+        23, 24, 27, 28, 29, 31, 32, 36, 37, 38, 39, 46, 47
+    ),
+    (2, 2, 48, 2, 2): (
+        86, 87, 90, 93, 106, 107, 109, 174, 175, 204, 205, 222, 223
+    ),
+    (2, 3, 48, 2, 2): (
+        136, 192, 193, 194, 195, 196, 197, 198, 199
+    ),
+    (2, 2, 24, 2, 2): (
+        44, 45, 49, 50, 51, 96, 100
+    ),
+    (2, 2, 4, 2, 2): (
+        14, 15, 18, 19, 21
+    ),
+    (2, 2, 12, 2, 2): (
+        42, 43, 48, 54, 66
+    ),
+    (2, 3, 32, 2, 2): (
+        128, 129, 132, 134, 135
+    ),
+    (2, 4, 4, 2, 2): (
+        13, 16, 17
+    ),
+    (2, 4, 8, 2, 2): (
+        25, 26, 35
+    ),
+    (2, 3, 8, 2, 2): (
+        33, 34
+    ),
+    (2, 3, 12, 2, 2): (
+        40, 41
+    ),
+    (2, 4, 16, 2, 2): (
+        67, 68
+    ),
+    (2, 2, 32, 2, 2): (
+        189,
+    ),
+    (2, 3, 4, 2, 2): (
+        20,
+    ),
+}
+EUCLID_GEO = {w: spec for spec, widths in _EUCLID_GEO.items() for w in widths}
+
+
+def _select_extra(w, ring):
+    """Wires beyond a ring of that length for the select bits' copies: enough for one copy of each
+    a bit, or none (fewer do not shorten the step)."""
+    lay = ring_layout_u6(ring) if w > RIPPLE_MAX_W else None
+    if lay is None:
+        return 0
+    k = 2 * max(w - lay[0], 0)
+    return k if k <= STEP_FREE else 0
+
+
+def _step_scratch(w, ring):
+    """Wires a step takes beyond its ring for the early strip bit's copies. ring: the ring's
+    length. The select bits' copies come first; the strip bit's, on two sets of wires in turn,
+    only where both fit in STEP_FREE."""
+    if not (TWO_EARLY and ring and w >= 4):
+        return 0
+    k = min((w - 1) // 2 + 1, TWO_EARLY)
+    sets = 2 if TWO_ALTERNATE else 1
+    return k if _select_extra(w, ring) + sets * (k + 1) <= STEP_FREE else 0
+
+
+def _step_hold(w, ring):
+    """Wires the pass holds through every other step, so that two steps in a row take different
+    scratch: the step's carry-in, and with the early strip bit that bit and its copies, which the
+    next step would otherwise wait for."""
+    k = _step_scratch(w, ring)
+    return 1 + (k + 1 if k and TWO_ALTERNATE else 0)
 
 
 def _ring_size(w, avail):
@@ -179,24 +279,29 @@ def ring_layout_u6(n):
     return n // 2, n
 
 
-def _fan(C, src, copies):
-    """CX src into each clean copy by doubling: depth about log2(len(copies) + 1)."""
+def _fan(C, src, copies, stop=None):
+    """CX src into each clean copy by doubling: depth about log2(len(copies) + 1). With stop, only
+    the copies before that index, for a tree whose later copies are already there: each gate's
+    source is src or an earlier copy, and a copy keeps its value while its source is cleared."""
     have = [src]
     todo = list(copies)
+    made = 0
     while todo:
         new = []
         for s in have:
             if not todo:
                 break
             d = todo.pop(0)
-            C.cx(s, d)
+            if stop is None or made < stop:
+                C.cx(s, d)
+            made += 1
             new.append(d)
         have += new
 
 
-def _unfan(C, src, copies):
+def _unfan(C, src, copies, stop=None):
     g = _Gates()
-    _fan(g, src, copies)
+    _fan(g, src, copies, stop)
     _emit(C, reversed(g.ops))
 
 
@@ -215,6 +320,14 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
     assert w >= 2 and lay is not None
     r, _ = lay
     G0, G1 = list(ring[:r]), list(ring[r:2 * r])
+    # A copy of g0 and of g1 for every bit: the ring holds half of them, the rest sit on wires
+    # that are free through the whole pass, so no bit's select waits for another bit's.
+    more = C.alloc(_select_extra(w, len(ring)))
+    x = len(more) // 2
+    ringed = len(G0)
+    G0 += more[:x]
+    G1 += more[x:]
+    r = len(G0)
     (cin,) = C.alloc(1)
     for wire in V:
         C.x(wire)
@@ -223,7 +336,7 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
         up.cx(U[i], V[i])
     up.cx(U[0], cin)
     adjacent_xor(up, U)
-    lookahead_sweep(up, [cin] + list(U), [None] + list(V), list(ring))
+    lookahead_sweep(up, [cin] + list(U), [None] + list(V), list(ring), EUCLID_GEO.get(w))
     _emit(C, up.ops)
     _fan(C, g0, G0)
     C.ccx(g0, U[-1], g1)
@@ -233,11 +346,12 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
         C.ccx(G1[i % r], V[i], k)
         C.ccx(G0[i % r], k, V[i])
         C.cx(G0[i % r], V[i])
-    _unfan(C, g1, G1)
-    _unfan(C, g0, G0)
+    # The ring's copies make way for the sweep's temps; the others stay for the last layer.
+    _unfan(C, g1, G1, ringed)
+    _unfan(C, g0, G0, ringed)
     _emit(C, reversed(up.ops))
-    _fan(C, g0, G0)
-    _fan(C, g1, G1)
+    _fan(C, g0, G0, ringed)
+    _fan(C, g1, G1, ringed)
     for i in range(w):
         C.cx(G1[i % r], U[i])
         C.x(V[i])
@@ -247,6 +361,7 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
     _unfan(C, g1, G1)
     _unfan(C, g0, G0)
     C.free([cin])
+    C.free(more)
 
 
 # Widths at which the step uses the in-place ripple below instead of a ring variant: there it has
@@ -493,24 +608,51 @@ class DialogMultiplier:
                 offset = E[0]
                 C.cx(offset, V[0])
                 C.cx(V[0], g0)
+
+                def strip(bit):
+                    # two = [no subtract and the bit under V's lowest equals E's].
+                    C.cx(offset, bit)
+                    C.x(g0)
+                    C.x(bit)
+                    C.ccx(g0, bit, two)
+                    C.x(bit)
+                    C.x(g0)
+                    C.cx(offset, bit)
+
+                # two reads V[1] where there is no subtract, and there the difference leaves V
+                # alone, so it and its copies are made before the difference instead of after
+                # it, on wires that are free through the whole pass.
+                early = _step_scratch(w, len(cp))
+                if early:
+                    (two,) = C.alloc(1)
+                    if TWO_SPLIT:
+                        # The same bit as ~g0 V[1] ^ ~g0 E ^ ~g0: V[1] is read once and not written,
+                        # so the difference's first gate on it waits 8 ticks and not 12.
+                        C.x(g0)
+                        C.ccx(g0, V[1], two)
+                        C.ccx(g0, offset, two)
+                        C.cx(g0, two)
+                        C.x(g0)
+                    else:
+                        strip(V[1])
+                    tc = C.alloc(early)
+                    _fanout(C, two, tc)
                 self._shared_difference(U[:w], V[:w], g0, b, list(cp))
                 V[:] = V[1:] + V[:1]
                 # A no-subtract tick strips a second bit when V + E is even.
-                (two,) = C.alloc(1)
-                C.cx(offset, V[0])
-                C.x(g0)
-                C.x(V[0])
-                C.ccx(g0, V[0], two)
-                C.x(V[0])
-                C.x(g0)
-                C.cx(offset, V[0])
-                C.cx(two, b)
-                C.ccx(two, offset, V[0])
+                if not early:
+                    (two,) = C.alloc(1)
+                    strip(V[0])
+                C.cx(tc[-1] if early else two, b)
+                C.ccx(tc[-1] if early else two, offset, V[0])
                 # A subtract keeps its swap on E and moves the old offset to the cell. It follows
                 # the gates above so that `two` does not wait for it: on g0 they do nothing (two
                 # is 0 and the two CXs from offset cancel), and off g0 the swap does nothing.
                 cswap(C, g0, [offset], [b])
-                if cp:
+                if early:
+                    _par_rotate(C, two, V[:w - 1], tc, fanned=True)
+                    C.free(tc)
+                elif cp:
                     _par_rotate(C, two, V[:w - 1], list(cp))
                 else:
                     for i in range(w - 2):
@@ -600,11 +742,11 @@ class DialogMultiplier:
                 self.C.apply(tick0, [U, V, E, cell, available[:k]])
             else:
                 # Alternate clean scratch so adjacent carry and strip sweeps can overlap.
-                hold = self.C.alloc(1) if i % 2 else []
                 k = _ring_size(w, len(available))
                 full = tree_temps(w + 1, 1)
-                borrow = (self.C.alloc(full - len(available))
-                          if WIDE_RING and k < full <= len(available) + RING_BORROW else [])
+                nb = full - len(available) if WIDE_RING and k < full <= len(available) + RING_BORROW else 0
+                hold = self.C.alloc(_step_hold(w, len(available) + nb if nb else k)) if i % 2 else []
+                borrow = self.C.alloc(nb)
                 ring = available + borrow if borrow else available[:k]
                 self.C.apply(self._euclid_step(w, len(ring)), [U[:w], V, E, cell, ring])
                 self.C.free(borrow)
