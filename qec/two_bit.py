@@ -183,7 +183,7 @@ LA_NTEMPS, LA_NCOPIES = 8, 6
 LA_F_WIDE = (3, 34)
 LA_B_WIDE = (3, 35)
 # The add's carry and t serve as temps in its sweeps; temps go out free-first under the tick model.
-LA_TOP_TEMPS = True
+LA_TOP_TEMPS = False
 LA_IDLE_TEMPS = True
 # The tick's P as PrefixR, whose write runs its blocks in parallel. At 221 bits: ten blocks, the top
 # one small, since the write starts with the top block's ladder (DESIGN.md, "Ten P blocks" and "P's
@@ -195,7 +195,7 @@ HIGH_CARRIERS = True
 LATE_FINAL_WIRES = True
 LATE_MIN_COPIES = 6
 # Copies of p for un-copying it from the word after the add (1 = none).
-P_FAN = 32
+P_FAN = 64
 # Run the tick's add as 2elliot depth/v2's CDKM ripple instead of either add above: 579,096
 # fewer CCX on the whole circuit for 1,535,700 more ticks (measured after the post-pass).
 CDKM_ADD = False
@@ -226,10 +226,10 @@ COPY_IDLE = True
 # each end up to cap bits, so a block's tree is as deep as the chain is late in reaching it; inside,
 # a block splits `fan` ways down to runs of `leaf` bits. A sweep of S blocks costs 4m - 3S CCX
 # whatever is inside them, and the chain pays its 7 (forward) or 11 (backward) ticks only S times.
-WIDE_ADD_TREE_F = (2.0, 2, 32, 2, 3)
+WIDE_ADD_TREE_F = (2.0, 4, 64, 2, 2)
 # The rotation's swaps read J from the sweeps' temps as well, which are clean by then.
 WIDE_ADD_ROT_TEMPS = True
-WIDE_ADD_TREE_B = (3, 2.5, 128, 2, 3)
+WIDE_ADD_TREE_B = (2, 2.5, 128, 2, 2)
 # The second wave too. Left serial, it follows the backward sweep down the word, and the rotation
 # starts on the middle bits meanwhile; as a network it waits for the sweep's last bit.
 WIDE_WAVE_BACK = True
