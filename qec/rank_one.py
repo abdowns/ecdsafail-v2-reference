@@ -6,17 +6,37 @@ U, V < 2^w with w = tick_widths(q, T)[T - j]. Unreduced, a tick is its add-or-sh
 no Prefix, low chains, compare or k machinery. One conversion after cell J reduces both registers:
 
   fold      X = hi*2^n + lo -> (X mod q, m = floor(X/q)), for q = 2^n - f with (2^w + 2)f <= 2^n:
-            m = hi + e, e = [lo + (hi + 1)f >= 2^n], X mod q = lo + m*f mod 2^n
-  cofactors (U, V) from the cells, on w-bit registers
-  D         V*mR - U*mS = D = (U*s - V*r)/q, in (-V, U) when V > 0 and 0 when V = 0, so |D| < 2^w:
-            mS -> D in place on w + 1 wires, mod 2^(w + 1)
-  mR        the cells' tick mod U maps (mR, 0) to (0, V*mR mod U) = (0, D mod U) in place
-  undo      D mod U; then D*q - U*s + V*r = 0 mod 2^(w + 1) clears D from r's and s's low bits;
-            the cofactors
+            m = hi + e, e = [lo + (hi + 1)f >= 2^n], X mod q = lo + m*f mod 2^n.
+            The quotients are a = floor(U*y/q) from R and b = floor(V*y/q) from S.
+  copies    the cofactors are not built here. The Euclid pass copies U before each of its last J
+            ticks, and V and its offset before the first of them (keep_state), and the inverse
+            Euclid pass clears the copies.
+  D         V*a - U*b = D = (U*s - V*r)/q, in (-V, U) when V > 0 and 0 when V = 0, so |D| < 2^w:
+            on w + 1 fresh wires, mod 2^(w + 1)
+  descent   level k is the state after k cells. D's cells walk from level J to level 1 and leave two
+            digits a cell (d_descent); the quotients' cells read the digits and end at (0, 0)
+            (k_descent); D's cells undone give D back.
+  clear     D*q = U*s - V*r, so -q*D + U*s - V*r = 0 mod 2^(w + 1) clears D from r's and s's low bits.
+
+The descent's invariant, at every level: 0 <= a < U, and D = V*a - U*b in (-V, U), or 0 when V = 0.
+Level 1 has (U, V) = (1, g0) with g0 the terminal cell's bit, so there (a, b, D) = (0, 0, 0).
+A cell undone takes level k + 1 to level k, with U = U_k odd:
+
+  swap      on an add with b: (a, b) trade places and D -> -D
+  d0        D mod 2, then D -> (D + d0*U)/2
+  d1        add:  [D < 0] when d0 = 0, then D -> D + d1*U
+            J:    D mod 2, then D -> (D + d1*U)/2
+            B1:   0
+  b         (b - g0*a - d0 - 2*d1)/2, and half of that again on J
+
+Each line keeps D = V*a - U*b and lands in the level's range. On an add the cofactor above is
+V' = 2V + U, so D' lies in (-2V - U, U): an odd D' takes d0 = 1 and lands in (-V, U); an even D'
+halves into (-V - U/2, U/2), and adding U when that is negative lands in (-V, U). On a shift the
+cofactor above is 2V or 4V and each halving lands in the range one level down. The digits are a
+choice, not the true floors one level down: any choice that keeps the invariant ends at (0, 0, 0).
 
 The middle cells use the tree's add-or-shift and held offset on wider words. The last cell is
-semantic (a B1 doubles, adding nothing), so the reduced tick after it starts with no held lane.
-docs/rank-one.md states the premises and the checks."""
+semantic (a B1 doubles, adding nothing), so the reduced tick after it starts with no held lane."""
 from .arith import _maj, _uma, add_const, cswap
 from .two_bit import Prefix, TwoBitMod
 
@@ -104,19 +124,6 @@ def carry_into(C, a, b, flag, ctl=None):
     C.free([c0] + ext)
 
 
-def greater(C, a, b, flag, ctl=None):
-    """flag ^= [a > b] for any widths, the carry of a + ~b."""
-    k = max(len(a), len(b))
-    pa, pb = C.alloc(k - len(a)), C.alloc(k - len(b))
-    a, b = list(a) + pa, list(b) + pb
-    for w in b:
-        C.x(w)
-    carry_into(C, a, b, flag, ctl)
-    for w in b:
-        C.x(w)
-    C.free(pa + pb)
-
-
 def inc(C, x, ctl):
     (one,) = C.alloc(1)
     C.cx(ctl, one)
@@ -133,26 +140,19 @@ def dec(C, x, ctl):
     C.free([one])
 
 
-def mul_acc(C, a, b, acc, sign=1):
-    """acc += a*b (sign -1: acc -= a*b) mod 2^len(acc), row i on acc[i:]."""
+def mul_acc(C, a, b, acc, sign=1, odd=False):
+    """acc += a*b (sign -1: acc -= a*b) mod 2^len(acc), row i on acc[i:]. With odd, a holds the bits
+    above the low 1 of an odd factor, and row 0 adds b with no control."""
     if sign < 0:
         for w in acc:
             C.x(w)
-    for i, ai in enumerate(a[:len(acc)]):
+    if odd:
+        add(C, b[:len(acc)], acc)
+    for i, ai in enumerate(a[:len(acc) - odd], int(odd)):
         add(C, b[:len(acc) - i], acc[i:], ctl=ai)
     if sign < 0:
         for w in acc:
             C.x(w)
-
-
-def mul_odd(C, u, x):
-    """x = u*x mod 2^len(x) in place, u odd: x[i + 1:] += x_i*(u >> 1), i from the top down, so each
-    step reads a bit that no later step changes."""
-    k = len(x)
-    for i in range(k - 2, -1, -1):
-        part = u[1:][:k - i - 1]
-        if part:
-            add(C, part, x[i + 1:], ctl=x[i])
 
 
 def mul_odd_const(C, x, c):
@@ -176,22 +176,27 @@ def _csd(c):
     return out
 
 
-def _times(C, x, out, c, inverse):
-    """out += c*x mod 2^len(out), out 0 before: a copy at one +1 digit of c, an add or subtract at
-    each other."""
+def _times(C, x, out, c, inverse, top):
+    """out += c*x mod 2^len(out), out 0 before and x <= top: a copy at one +1 digit of c, an add or
+    subtract at each other. Until the first subtract the sum is under a known bound, and an add
+    stops at the bound's top bit."""
     W = len(out)
     terms = [t for t in _csd(c) if t[0] < W]
     pivot = next(t for t in terms if t[1] > 0)
     rest = [t for t in terms if t is not pivot]
     s0 = pivot[0]
+    bound, ends = top << s0, []
+    for s, d in rest:
+        bound = bound + (top << s) if d > 0 and bound is not None else None
+        ends.append(W if bound is None else min(W, bound.bit_length()))
     if not inverse:
         for i, w in enumerate(x[:W - s0]):
             C.cx(w, out[s0 + i])
-        for s, d in rest:
-            (add if d > 0 else sub)(C, x[:W - s], out[s:])
+        for (s, d), e in zip(rest, ends):
+            (add if d > 0 else sub)(C, x[:e - s], out[s:e])
     else:
-        for s, d in reversed(rest):
-            (sub if d > 0 else add)(C, x[:W - s], out[s:])
+        for (s, d), e in reversed(list(zip(rest, ends))):
+            (sub if d > 0 else add)(C, x[:e - s], out[s:e])
         for i, w in enumerate(x[:W - s0]):
             C.cx(w, out[s0 + i])
 
@@ -205,13 +210,12 @@ def split(c, top):
 
 
 class RankOne:
-    # Clear the fold's quotients by the descent; off, by D mod U and the cells' tick mod U.
-    DESCENT = True
-
     def __init__(self, q, J, w, steps=None):
         """steps[k] bounds the cofactors' bits after k cells, steps[J] = w."""
         self.q, self.J, self.w = q, J, w
-        self.steps = steps or [w] * (J + 1)
+        self.steps = steps or list(range(w - J, w + 1))
+        # each level's cofactors are one bit wider than the level's below
+        assert all(self.steps[k + 1] == self.steps[k] + 1 for k in range(1, J)) and self.steps[J] == w
         self.n = n = q.bit_length()
         self.f = (1 << n) - q
         self.W = ((2 ** w) * self.f).bit_length()
@@ -318,7 +322,7 @@ class RankOne:
 
         def times(inverse=False):
             if low:
-                _times(C, hi, low, lo_c, inverse)
+                _times(C, hi, low, lo_c, inverse, top)
 
         times()
         (e,) = C.alloc(1)
@@ -357,177 +361,6 @@ class RankOne:
         times(inverse=True)
         C.free(own + spare)
 
-    def cofactors(self, C, cells, U, V):
-        """(U, V) of the cells from (1, 0), semantic: g0: V = 2V + U, swap on b; J: V = 4V;
-        B1: V = 2V. The first cell is the terminal one, A0 or J, where V = g0."""
-        C.x(U[0])
-        C.cx(cells[0][0], V[0])
-        for k, (g0, b) in enumerate(cells[1:], 2):
-            u, v = self._narrow(U, V, k)
-            self._cof_cell(C, g0, b, u, v)
-            U[:len(u)], V[:len(v)] = u, v
-
-    def _narrow(self, U, V, k):
-        m = min(len(U), self.steps[k])
-        return U[:m], V[:m]
-
-    def _cof_cell(self, C, g0, b, U, V):
-        V[:] = V[-1:] + V[:-1]
-        add(C, U, V, ctl=g0)
-        (j,) = C.alloc(1)
-        C.x(g0)
-        C.ccx(g0, b, j)
-        C.x(g0)
-        for i in range(len(V) - 1, 0, -1):
-            C.cx(V[i - 1], V[i])
-            C.ccx(j, V[i], V[i - 1])
-            C.cx(V[i - 1], V[i])
-        C.x(g0)
-        C.ccx(g0, b, j)
-        C.x(g0)
-        C.free([j])
-        (sw,) = C.alloc(1)
-        C.ccx(g0, b, sw)
-        cswap(C, sw, U, V)
-        C.ccx(g0, b, sw)
-        C.free([sw])
-
-    def residue(self, C, U, D, Q):
-        """D (w + 1 wires, two's complement) -> D mod U on D[:w] in place, its sign kept on D[w];
-        Q (w wires, 0 before) takes the quotient bits of |D| by U."""
-        w = self.w
-        sigma, N = D[w], D[:w]
-        for x in N:
-            C.cx(sigma, x)
-        inc(C, N, sigma)
-        small = self._below(C, U)
-        for i in range(w - 1, -1, -1):
-            # Q[i] = [N >> i >= U] = small[i]*[N >> i >= U mod 2^(w - i)], small[i] = [U < 2^(w - i)]
-            if i:
-                greater(C, U[:w - i], N[i:], Q[i], ctl=small[i])
-                C.cx(small[i], Q[i])
-            else:
-                greater(C, U, N, Q[i])
-                C.x(Q[i])
-            sub(C, U[:w - i], N[i:], ctl=Q[i])
-        self._below(C, U, small)
-        (ctl,) = C.alloc(1)
-        nz = self._nonzero(C, N)
-        C.ccx(sigma, nz, ctl)
-        self._nonzero(C, N, nz)
-        for x in N:
-            C.cx(ctl, x)
-        inc(C, N, ctl)
-        add(C, U, N, ctl=ctl)
-        nz = self._nonzero(C, N)
-        C.ccx(sigma, nz, ctl)
-        self._nonzero(C, N, nz)
-        C.free([ctl])
-
-    @staticmethod
-    def _below(C, U, small=None):
-        """small[i] = [U < 2^(w - i)] for 1 <= i < w, the AND of U's top i bits complemented, on fresh
-        wires; with small given, its clear."""
-        w = len(U)
-        top = U[::-1]
-        for x in top[:w - 1]:
-            C.x(x)
-        if small is None:
-            small = [None] + C.alloc(w - 1)
-            C.cx(top[0], small[1])
-            for i in range(2, w):
-                C.ccx(small[i - 1], top[i - 1], small[i])
-        else:
-            for i in reversed(range(2, w)):
-                C.ccx(small[i - 1], top[i - 1], small[i])
-            C.cx(top[0], small[1])
-            C.free(small[1:])
-        for x in top[:w - 1]:
-            C.x(x)
-        return small
-
-    def _nonzero(self, C, x, nz=None):
-        """A fresh wire holding [x != 0], or with nz given, its clear."""
-        for w in x:
-            C.x(w)
-        chain = []
-        z = x[0]
-        for w in x[1:]:
-            (a,) = C.alloc(1)
-            C.ccx(z, w, a)
-            chain.append(a)
-            z = a
-        if nz is None:
-            (out,) = C.alloc(1)
-            C.cx(z, out)
-            C.x(out)
-        else:
-            C.x(nz)
-            C.cx(z, nz)
-            C.free([nz])
-            out = None
-        prev = [x[0]] + chain[:-1]
-        for i in reversed(range(len(chain))):
-            C.ccx(prev[i], x[i + 1], chain[i])
-        C.free(chain)
-        for w in x:
-            C.x(w)
-        return out
-
-    def _mod_double(self, C, U, s, ctl=None):
-        """s = 2s mod U (or under ctl), s < U odd on w + 1 wires with top 0. Its flag [2s >= U] is
-        then the new s0."""
-        (beta,) = C.alloc(1)
-        if ctl is None:
-            s[:] = s[-1:] + s[:-1]
-            greater(C, U, s, beta)
-            C.x(beta)
-            sub(C, U, s, ctl=beta)
-            C.cx(s[0], beta)
-        else:
-            for i in range(len(s) - 1, 0, -1):
-                C.cx(s[i - 1], s[i])
-                C.ccx(ctl, s[i], s[i - 1])
-                C.cx(s[i - 1], s[i])
-            greater(C, U, s, beta, ctl=ctl)
-            C.cx(ctl, beta)
-            sub(C, U, s, ctl=beta)
-            C.ccx(ctl, s[0], beta)
-        C.free([beta])
-
-    def _mod_add(self, C, U, r, s, ctl):
-        """s = s + ctl*r mod U; the flag is ctl*[s < r] after."""
-        (beta,) = C.alloc(1)
-        add(C, r, s, ctl=ctl)
-        greater(C, U, s, beta)
-        C.x(beta)
-        sub(C, U, s, ctl=beta)
-        greater(C, r, s, beta, ctl=ctl)
-        C.free([beta])
-
-    def small_pass(self, C, cells, U, r, s):
-        """(z, 0) -> (U*z mod U, V*z mod U) = (0, V*z mod U): the cells' semantic tick mod U."""
-        w = self.w
-        for i in range(w):
-            C.ccx(cells[0][0], r[i], s[i])
-        for g0, b in cells[1:]:
-            self._mod_double(C, U, s)
-            self._mod_add(C, U, r, s, g0)
-            (j,) = C.alloc(1)
-            C.x(g0)
-            C.ccx(g0, b, j)
-            C.x(g0)
-            self._mod_double(C, U, s, ctl=j)
-            C.x(g0)
-            C.ccx(g0, b, j)
-            C.x(g0)
-            C.free([j])
-            (sw,) = C.alloc(1)
-            C.ccx(g0, b, sw)
-            cswap(C, sw, r, s[:w])
-            C.ccx(g0, b, sw)
-            C.free([sw])
-
     # -- the descent ---------------------------------------------------------------------------------
     #
     # Level k is the state after k cells: cofactors (U_k, V_k) below 2^m(k), quotients (a, b) with
@@ -550,41 +383,27 @@ class RankOne:
     def stash_size(self):
         return sum(self.m(i) - 1 for i in range(2, self.J))
 
-    def cofactors_kept(self, C, cells, U, V, stash):
-        """cofactors, with each level's U copied to the stash on the way."""
-        C.x(U[0])
-        C.cx(cells[0][0], V[0])
-        for k, (g0, b) in enumerate(cells[1:], 2):
-            u, v = self._narrow(U, V, k)
-            self._cof_cell(C, g0, b, u, v)
-            U[:len(u)], V[:len(v)] = u, v
-            if k < self.J:
-                for x, y in zip(u[1:], self.stash_at(stash, k)):
-                    C.cx(x, y)
-
     def pool_size(self):
-        """Zero wires the D cells borrow beside D's own."""
-        bal = need = 0
-        for k in range(self.J - 1, 0, -1):
-            bal -= 3
-            need = max(need, -bal)
-            bal += self.m(k + 1) + 1 - self.m(k)
-        return need
+        """Zero wires the D cells borrow beside D's own: each takes two and gives one back."""
+        return self.J
 
     def _d_cell(self, C, g0, b, Uk, D, pool, m):
-        """D (level k + 1, two's complement) -> (D at level k on m + 1 wires, d0, d1). Uk is U_k."""
+        """D (level k + 1, m + 2 wires, two's complement) -> (D at level k on m + 1 wires, d0, d1).
+        Uk is U_k."""
+        assert len(D) == m + 2
         (sw,) = C.alloc(1)
         C.ccx(g0, b, sw)
         # -D = (D ^ sw) + sw; d0 = D mod 2 leaves D on its own low wire
         for x in D:
             C.cx(sw, x)
         C.cx(sw, D[0])
-        d0 = D[0]
-        ext = pool.pop()
-        C.cx(D[-1], ext)
-        X = D[1:] + [ext]
-        # (D + d0*U)/2 = (D >> 1) + d0*(U >> 1) + [d0 or sw], U odd
-        mask = C.alloc(len(Uk) - 1)
+        d0, X = D[0], D[1:]
+        # (D + d0*U)/2 = (D >> 1) + d0*(U >> 1) + [d0 or sw], U odd. It lies in (-V - U/2, U), inside
+        # X's m + 1 wires: the cofactors above are below 2^(m + 1) and U is below 2^m.
+        # d0*(U >> 1) rests on the pool's idle wires, and on fresh ones where the pool is short
+        idle = pool[:len(Uk) - 1]
+        fresh = C.alloc(len(Uk) - 1 - len(idle))
+        mask = idle + fresh
         for u, t in zip(Uk[1:], mask):
             C.ccx(d0, u, t)
         (cin,) = C.alloc(1)
@@ -598,7 +417,7 @@ class RankOne:
         C.free([cin])
         for u, t in zip(Uk[1:], mask):
             C.ccx(d0, u, t)
-        C.free(mask)
+        C.free(fresh)
         (jj,) = C.alloc(1)
         C.cx(b, jj)
         C.cx(sw, jj)
@@ -616,19 +435,17 @@ class RankOne:
         X = X + [ext]
         add(C, Uk, X, ctl=d1)
         _shift_down(C, jj, X)
-        # the wires above the low m + 1 hold the sign, but for the top one after a shift
+        # the top wire holds the sign again, or 0 after a shift
         C.x(jj)
         C.ccx(jj, X[m], X[-1])
         C.x(jj)
-        for x in X[m + 1:-1]:
-            C.cx(X[m], x)
-        pool.extend(X[m + 1:])
+        pool.append(X.pop())
         C.cx(sw, jj)
         C.cx(b, jj)
         C.free([jj])
         C.ccx(g0, b, sw)
         C.free([sw])
-        return X[:m + 1], d0, d1
+        return X, d0, d1
 
     def d_descent(self, C, flat, stash, DG):
         """DG = D at level J (w + 1 wires) and pool_size() zero wires -> the digits, cell J first,
@@ -693,99 +510,6 @@ class RankOne:
                 b += C.alloc(m - len(b))
         C.free(a + b)
 
-    def convert(self, C, term, cells, R, S):
-        """R, S (L wires each) from (U*y, V*y) to (U*y mod q, V*y mod q) on their low n wires; the
-        wires above are 0 after. term is the first cell's g0, cells the others' (g0, b)."""
-        if self.DESCENT:
-            return self.convert_descent(C, term, cells, R, S)
-        n, w = self.n, self.w
-        C.free(R[n + w:] + S[n + w:])
-        del R[n + w:], S[n + w:]
-        self.fold(C, R)
-        self.fold(C, S)
-        r, mR, s, mS = R[:n], R[n:n + w], S[:n], S[n:n + w]
-        flat = [term] + [x for c in cells for x in c]
-        U, V = C.alloc(w), C.alloc(w)
-
-        def first(flat, U, V):
-            cs = [flat[:1] + [None]] + [flat[k:k + 2] for k in range(1, len(flat), 2)]
-            self.cofactors(C, cs, U, V)
-
-        regs1 = [flat, U, V]
-        b1 = C.run(first, regs1)
-        # D = V*mR - U*mS on mS's wires and one more: ~(U*mS) + V*mR + 1
-        D = mS + C.alloc(1)
-        mul_odd(C, U, D)
-        for x in D:
-            C.x(x)
-        mul_acc(C, V, mR, D)
-        (one,) = C.alloc(1)
-        C.x(one)
-        add(C, [one], D)
-        C.x(one)
-        C.free([one])
-        del S[n:]
-        Q = C.alloc(w)
-        regs2 = [U, D, Q]
-        b2 = C.run(lambda U, D, Q: self.residue(C, U, D, Q), regs2)
-        sp = C.alloc(w + 1)
-        self.small_pass(C, [[term, None]] + cells, U, mR, sp)
-        for i in range(w):
-            C.cx(D[i], sp[i])
-        C.free(sp)
-        C.apply(b2, regs2, inverse=True)
-        C.free(Q)
-        # D*q = U*s - V*r, so D*q - U*s + V*r is 0 mod 2^(w + 1)
-        k = w + 1
-        mul_odd_const(C, D, self.q % (1 << k))
-        mul_acc(C, U, s[:k], D, sign=-1)
-        mul_acc(C, V, r[:k], D)
-        C.apply(b1, regs1, inverse=True)
-        C.free(U + V + D + mR)
-        del R[n:]
-
-
-    def convert_descent(self, C, term, cells, R, S):
-        n, w, J = self.n, self.w, self.J
-        C.free(R[n + w:] + S[n + w:])
-        del R[n + w:], S[n + w:]
-        self.fold(C, R)
-        self.fold(C, S)
-        r, a, s, b = R[:n], R[n:], S[:n], S[n:]
-        flat = [term] + [x for c in cells for x in c]
-        U, V, stash = C.alloc(w), C.alloc(w), C.alloc(self.stash_size())
-
-        def first(flat, U, V, stash):
-            cs = [flat[:1] + [None]] + [flat[k:k + 2] for k in range(1, len(flat), 2)]
-            self.cofactors_kept(C, cs, U, V, stash)
-
-        regs1 = [flat, U, V, stash]
-        b1 = C.run(first, regs1)
-        D = C.alloc(w + 1)
-        mul_acc(C, V, a, D)
-        mul_acc(C, U, b, D, sign=-1)
-        DG = D + C.alloc(self.pool_size())
-        regs2 = [flat, stash, DG]
-        b2 = C.run(lambda flat, stash, DG: self.d_descent(C, flat, stash, DG), regs2)
-        nd = 2 * (J - 1)
-        spare = len(DG) - nd
-        C.free(DG[nd:])
-        del DG[nd:]
-        self.k_descent(C, cells, DG, a, b)
-        DG += C.alloc(spare)
-        C.apply(b2, regs2, inverse=True)
-        D = DG[:w + 1]
-        C.free(DG[w + 1:])
-        # D*q = U*s - V*r, so D*q - U*s + V*r is 0 mod 2^(w + 1)
-        k = w + 1
-        mul_odd_const(C, D, self.q % (1 << k))
-        mul_acc(C, U, s[:k], D, sign=-1)
-        mul_acc(C, V, r[:k], D)
-        C.apply(b1, regs1, inverse=True)
-        C.free(U + V + stash + D)
-        del R[n:], S[n:]
-
-
     # -- the Euclid pass's copies ----------------------------------------------------------------------
     #
     # Level k's cofactors are the Euclid pair before tick T - k, but for V inside a shift run that
@@ -835,45 +559,43 @@ class RankOne:
             C.x(x)
 
     def _swept_v(self, C, VJ, EJ, below, inverse=False):
-        """A fresh register with the swept V_J: (V + E), doubled inside a crossed run. below is the
-        g0 of the cell under the start. inverse takes that register back to zero wires."""
+        """A fresh register with the swept V_J: (V + E), doubled inside a crossed run, and the two
+        flag wires it was made with. below is the g0 of the cell under the start. inverse takes
+        what the forward call returned back to zero wires."""
         def twice(V, d):
             for i in range(len(V) - 1, 0, -1):
                 C.cx(V[i - 1], V[i])
                 C.ccx(d, V[i], V[i - 1])
                 C.cx(V[i - 1], V[i])
 
-        def flag(V, d):
-            (par,) = C.alloc(1)
-            self._odd_zeros(C, V, par)
+        def flag(V, par, d):
             C.x(below)
             C.ccx(below, par, d)
             C.x(below)
-            self._odd_zeros(C, V, par)
-            C.free([par])
 
         if not inverse:
             V = C.alloc(self.w)
-            (d,) = C.alloc(1)
+            par, d = C.alloc(2)
             for x, y in zip(VJ, V):
                 C.cx(x, y)
             inc(C, V, EJ)
-            flag(V, d)
+            self._odd_zeros(C, V, par)
+            flag(V, par, d)
             twice(V, d)
-            return V, d
-        V, d = inverse
-        for i in range(1, len(V)):
-            C.cx(V[i - 1], V[i])
-            C.ccx(d, V[i], V[i - 1])
-            C.cx(V[i - 1], V[i])
-        flag(V, d)
+            return V, par, d
+        V, par, d = inverse
+        _shift_down(C, d, V)
+        flag(V, par, d)
+        self._odd_zeros(C, V, par)
         dec(C, V, EJ)
         for x, y in zip(VJ, V):
             C.cx(x, y)
-        C.free(V + [d])
+        C.free(V + [par, d])
 
-    def convert_kept(self, C, term, cells, R, S, keep, below):
-        """convert, with the cofactors read from the Euclid pass's copies."""
+    def convert(self, C, term, cells, R, S, keep, below):
+        """R, S (L wires each) from (U*y, V*y) to (U*y mod q, V*y mod q) on their low n wires; the
+        wires above are 0 after. term is the first cell's g0, cells the others' (g0, b), keep the
+        Euclid pass's copies, and below the g0 of the cell under the start."""
         n, w, J = self.n, self.w, self.J
         C.free(R[n + w:] + S[n + w:])
         del R[n + w:], S[n + w:]
@@ -882,13 +604,11 @@ class RankOne:
         r, a, s, b = R[:n], R[n:], S[:n], S[n:]
         flat = [term] + [x for c in cells for x in c]
         stash, UJ, VJ, EJ = self.kept(keep)
-        (one,) = C.alloc(1)
-        C.x(one)
-        U = [one] + UJ
-        V, d = self._swept_v(C, VJ, EJ, below)
+        made = self._swept_v(C, VJ, EJ, below)
+        V = made[0]
         D = C.alloc(w + 1)
         mul_acc(C, V, a, D)
-        mul_acc(C, U, b, D, sign=-1)
+        mul_acc(C, UJ, b, D, sign=-1, odd=True)
         DG = D + C.alloc(self.pool_size())
         regs2 = [flat, stash, DG]
         b2 = C.run(lambda flat, stash, DG: self.d_descent(C, flat, stash, DG), regs2)
@@ -901,13 +621,13 @@ class RankOne:
         C.apply(b2, regs2, inverse=True)
         D = DG[:w + 1]
         C.free(DG[w + 1:])
+        # D*q = U*s - V*r, so -q*D + U*s - V*r is 0 mod 2^(w + 1); -q is f there, a short constant
         k = w + 1
-        mul_odd_const(C, D, self.q % (1 << k))
-        mul_acc(C, U, s[:k], D, sign=-1)
-        mul_acc(C, V, r[:k], D)
-        self._swept_v(C, VJ, EJ, below, inverse=(V, d))
-        C.x(one)
-        C.free([one] + D)
+        mul_odd_const(C, D, -self.q % (1 << k))
+        mul_acc(C, UJ, s[:k], D, odd=True)
+        mul_acc(C, V, r[:k], D, sign=-1)
+        self._swept_v(C, VJ, EJ, below, inverse=made)
+        C.free(D)
         del R[n:], S[n:]
 
 

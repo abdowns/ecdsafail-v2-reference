@@ -23,9 +23,9 @@ class DialogMultiplier:
     RAW_TAPE = True
     # Chain carries the forward pass leaves as junk for the inverse pass. Each is held through the
     # Bezout pass and saves one CCX in each Euclid pass, so this is the one knob that trades wires
-    # for CCX; 503 puts the circuit at 4,096 wires at n = 256, beside the 369 swap wires, the 253
+    # for CCX; 523 puts the circuit at 4,096 wires at n = 256, beside the 369 swap wires, the 253
     # the pass keeps for the rank-one conversion, and that conversion's own.
-    CARRY_JUNK = 503
+    CARRY_JUNK = 523
     # A tick whose registers reach this many bits above its joint threshold runs those bits as one
     # high word, 3 CCX a bit, on a flag that says which register holds it. At n = 256 a word of 2 bits
     # costs more whole than plain, and 4 or more loses the lazy run, which starts at a word of 3. 3 keeps
@@ -48,9 +48,6 @@ class DialogMultiplier:
     # The Bezout pass's first cells run on unreduced integers, up to this many, then one conversion
     # (rank_one.py); 0 turns it off. From 22 the fold's product no longer splits (rank_one.split).
     RANK_J = 21
-    # The Euclid pass copies its last small states for the rank-one conversion, which then builds
-    # no cofactors of its own; the copies stay through the Bezout pass and the inverse pass clears them.
-    KEEP = True
     # (first, last): blocks only on these ticks. No real input still has U's word above the front where
     # the default run ends, so the exit swap's gate moves the run's ends to where built inputs do.
     LAG_SPAN = None
@@ -1445,8 +1442,9 @@ class DialogMultiplier:
         if not (self.RANK_J and self.RAW_TAPE and lend_tail and not tail and not self.blocks):
             return 0
         J = rank_one.plan(self.mod.q, self.iters, self.widths, self.RANK_J)
-        if J and self.KEEP:
-            # The Euclid pass copies plain words: every lazy tick must be under the start.
+        if J:
+            # The Euclid pass copies its last small states for the conversion, and it copies plain
+            # words: every lazy tick must be under the start.
             lazy = [i for i, key in enumerate(self._tick_plan()) if key and (key[9] or key[10])]
             J = min(J, self.iters - 1 - max(lazy, default=0))
         return J if J >= 3 else 0
@@ -1459,9 +1457,9 @@ class DialogMultiplier:
     def keep_width(self):
         """Wires the Euclid pass fills for the rank-one conversion: see rank_one.RankOne.kept."""
         J = self.rank_j
-        return self._rank(J).kept_size() if J and self.KEEP else 0
+        return self._rank(J).kept_size() if J else 0
 
-    def _rank_start(self, G, Yr, S, J, keep=None):
+    def _rank_start(self, G, Yr, S, J, keep):
         """Cells T - 1 down to T - J on unreduced integers, then one conversion. The tick after it
         is a first tick: the last cell here is semantic, so no lane is held."""
         C, T, n = self.C, self.iters, self.mod.n
@@ -1485,10 +1483,7 @@ class DialogMultiplier:
         i = T - J
         ro.last_tick(C, G[2 * i:2 * i + 2], G[2 * i + 2:2 * i + 4], p, R, Sw)
         cells = [G[2 * k:2 * k + 2] for k in range(T - 2, T - J - 1, -1)]
-        if keep:
-            ro.convert_kept(C, term, cells, R, Sw, keep, G[2 * (T - J - 1)])
-        else:
-            ro.convert(C, term, cells, R, Sw)
+        ro.convert(C, term, cells, R, Sw, keep, G[2 * (T - J - 1)])
         Yr[:], S[:] = R, Sw
 
     def _body(self, Xr, Yr):

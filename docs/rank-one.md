@@ -22,7 +22,7 @@ The cells run on the swept tape, where that identity is false inside a shift run
 The two pairs agree at every run boundary.
 At an interior boundary the forward tick before it was a double shift from (u, 4v), whose potential bounds max(u, 2v)² by the same B_t as the Euclid pair (`out/review-rankone/REVIEW.md`, "Exact premises and the width proof").
 So the swept cofactors meet the same width; nothing beyond the stack's width premise is assumed.
-At J = 14 the bound gives isqrt(B_370) = 23,170 < 2^15 after fourteen cells, and the fold's premises hold at w = 15 (`out/bezglue-w4/width-j14.txt`; the gate's `width_j.py` rechecks every k ≤ J from the generator).
+At J = 21 the generator's widths give w = 22, each level's bound is one bit above the level below, and the fold's premises hold (`rank_one.plan`, and the assert in `RankOne.__init__`).
 On a held lane the stored word is H − R0 with H = S + R, so the words hold n + w + 1 bits, and two more wires are the add-or-shift's top.
 
 **P2. The fold.** For X = hi·2ⁿ + lo < 2^w·q with (2^w + 2)·f ≤ 2ⁿ, m = hi + e with e = [lo + (hi + 1)f ≥ 2ⁿ] is ⌊X/q⌋, and lo + m·f mod 2ⁿ is X − m·q.
@@ -32,17 +32,25 @@ On a held lane the stored word is H − R0 with H = S + R, so the words hold n +
 
 ## The conversion
 
-1. Fold R and S (P2): (r, mR) and (s, mS), mR = ⌊U·y/q⌋, mS = ⌊V·y/q⌋.
-2. (U, V) from the cells on w-bit registers.
-3. D = (U·s − V·r)/q is an integer, in (−V, U) when V > 0 since r, s < q, and 0 when V = 0 (then U = 1 by coprimality), so |D| < 2^w and w + 1 wires hold it in two's complement.
-4. V·mR − U·mS = D, so mS becomes D in place on its own wires and one more: mS → U·mS mod 2^(w+1) (U is odd), complemented, plus V·mR, plus 1.
-5. D mod U from |D| by restoring division, then U − rem on a negative D with rem ≠ 0.
-6. The cells' tick mod U maps (mR, 0) in place to (U·mR mod U, V·mR mod U) = (0, D mod U), which the value of step 5 clears.
-7. Step 5 is undone. D·q = U·s − V·r, so D → D·q mod 2^(w+1), minus U·s, plus V·r, on the low w + 1 bits of r and s, ends at 0. Step 2 is undone.
+1. Fold R and S (P2): (r, a) and (s, b), with a = ⌊U·y/q⌋ and b = ⌊V·y/q⌋.
+2. The cofactors are not rebuilt. The Euclid pass copies U before each of its last J ticks, and V and its offset E before the first of them, onto `keep` wires (`keep_state`). The inverse Euclid pass clears the copies.
+   Level k's U is the Euclid U before tick T − k. Level J's swept V is (V + E) << d, with d = [the cell under the start is a shift] AND [V + E has an odd number of trailing zeros] (`_swept_v`).
+3. D = V·a − U·b = (U·s − V·r)/q is an integer, in (−V, U) when V > 0 since r, s < q, and 0 when V = 0. It goes on w + 1 fresh wires, mod 2^(w+1).
+4. The descent. Level k is the state after k cells, with invariant 0 ≤ a < U_k and D = V_k·a − U_k·b in (−V_k, U_k), or 0 when V_k = 0. A cell undone takes level k + 1 to level k:
+   - on an add with a swap, (a, b) trade places and D → −D;
+   - d0 = D mod 2, then D → (D + d0·U)/2;
+   - on an add, d1 = [D < 0] when d0 = 0, then D → D + d1·U; on J, d1 = D mod 2, then D → (D + d1·U)/2; on B1, d1 = 0;
+   - b → (b − g0·a − d0 − 2·d1)/2, and half of that again on J.
+
+   Each line keeps D = V·a − U·b and lands in the level's range, so level 1 is (a, b, D) = (0, 0, 0).
+   `d_descent` walks D down and leaves two digits a cell. `k_descent` walks (a, b) down by the digits to (0, 0). `d_descent` undone gives D back.
+5. D·q = U·s − V·r, so −q·D + U·s − V·r = 0 mod 2^(w+1) clears D from the low w + 1 bits of r and s. The swept V is unmade.
 
 ## Checks
 
-- `out/bezglue-w3/tools/m_check.py` runs M(x, y) = (x, x·y mod q) on every x in [1, q) and every y: q = 61 (J = 3), 251 (J = 4), 4093 (J = 9) and 8191 (J = 10), with every other wire 0.
-- The same script with a mutant: probing with hi in place of hi + 1, D with the wrong sign, a last cell that adds R on B1, no U − rem step, and words one bit short. Each fails on some lanes.
-- `out/bezglue-w3/z3/rank_one_z3.py` proves steps 2 to 6, P2 at secp256k1 and P3, each with a wrong twin it refutes.
+- `scripts/descent_model.py`: the descent on integers, over random cell sequences and every input at small primes.
+- `scripts/keep_model.py`: step 2's relation at every level of every x for eight primes up to 8,191 and of 3,000 x at secp256k1, against a sweep model that shares no code with the circuit.
+- `scripts/convert_check.py J [lanes] [seed] [mutant]`: the conversion alone at secp256k1, on cell sequences inside the width bound with the kept copies the Euclid pass would leave. Its mutants each drop one CCX.
+- `scripts/m_exhaustive.py q ...`: M(x, y) = (x, x·y mod q) on every x in [1, q) and every y with every other wire 0, at q = 61, 127, 251, 509, 1021, 2039, 4093 and 8191 (J from 3 to 8).
+- `scripts/long_run_check.py`: M at secp256k1 on x = m·2^k and q − m·2^k whose Euclid pass runs 364 to 382 ticks, so the window holds real cells. Random x never reach it.
 - `scripts/accept.py` runs the whole point addition at its toy primes; q = 61 takes the start with J = 3.
