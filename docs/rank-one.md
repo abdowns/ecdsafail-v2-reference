@@ -22,7 +22,7 @@ The cells run on the swept tape, where that identity is false inside a shift run
 The two pairs agree at every run boundary.
 At an interior boundary the forward tick before it was a double shift from (u, 4v), whose potential bounds max(u, 2v)² by the same B_t as the Euclid pair (`out/review-rankone/REVIEW.md`, "Exact premises and the width proof").
 So the swept cofactors meet the same width; nothing beyond the stack's width premise is assumed.
-At J = 21 the generator's widths give w = 22, each level's bound is one bit above the level below, and the fold's premises hold (`rank_one.plan`, and the assert in `RankOne.__init__`).
+At J = 24 the generator's widths give w = 25, each level's bound is one bit above the level below, and the fold's premises hold (`rank_one.plan`, and the assert in `RankOne.__init__`).
 On a held lane the stored word is H − R0 with H = S + R, so the words hold n + w + 1 bits, and two more wires are the add-or-shift's top.
 
 **P2. The fold.** For X = hi·2ⁿ + lo < 2^w·q with (2^w + 2)·f ≤ 2ⁿ, m = hi + e with e = [lo + (hi + 1)f ≥ 2ⁿ] is ⌊X/q⌋, and lo + m·f mod 2ⁿ is X − m·q.
@@ -52,5 +52,5 @@ On a held lane the stored word is H − R0 with H = S + R, so the words hold n +
 - `scripts/keep_model.py`: step 2's relation at every level of every x for eight primes up to 8,191 and of 3,000 x at secp256k1, against a sweep model that shares no code with the circuit.
 - `scripts/convert_check.py J [lanes] [seed] [mutant]`: the conversion alone at secp256k1, on cell sequences inside the width bound with the kept copies the Euclid pass would leave. Its mutants each drop one CCX.
 - `scripts/m_exhaustive.py q ...`: M(x, y) = (x, x·y mod q) on every x in [1, q) and every y with every other wire 0, at q = 61, 127, 251, 509, 1021, 2039, 4093 and 8191 (J from 3 to 8).
-- `scripts/long_run_check.py`: M at secp256k1 on x = m·2^k and q − m·2^k whose Euclid pass runs 364 to 382 ticks, so the window holds real cells. Random x never reach it.
+- `scripts/long_run_check.py`: M at secp256k1 on x = m·2^k and q − m·2^k whose Euclid pass runs 361 to 382 ticks, so the window holds real cells. Random x never reach it.
 - `scripts/accept.py` runs the whole point addition at its toy primes; q = 61 takes the start with J = 3.

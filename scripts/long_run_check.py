@@ -1,5 +1,5 @@
-"""long_run_check.py [mmax] [lanes] [dropK] : M(x, y) at secp256k1 on x whose Euclid pass runs 364 ticks or more, so
-that the rank-one window (the last 21 cells) holds real cells. Random x never do: the longest run in 100,000 is
+"""long_run_check.py [mmax] [lanes] [dropK] : M(x, y) at secp256k1 on x whose Euclid pass runs into the rank-one
+window (the last RANK_J cells), so that the window holds real cells. Random x never do: the longest run in 100,000 is
 about 325 ticks of 384. The x are m*2^k and q - m*2^k for odd m below mmax. dropK removes the K-th CCX emitted
 inside RankOne.convert, as a control that these inputs reach the conversion."""
 import sys, time, random
@@ -15,6 +15,8 @@ drop = int(sys.argv[3]) if len(sys.argv) > 3 else -1
 q = 2**256 - 2**32 - 977
 n = 256
 rng = random.Random(5)
+# the first tick count that reaches the window
+LOW = 384 - DialogMultiplier.RANK_J + 1
 t = time.time()
 
 def ticks(x):
@@ -34,7 +36,7 @@ for m in range(1, MM, 2):
         for x in (m << k, q - (m << k)):
             if 0 < x < q and x not in found:
                 c = ticks(x)
-                if c >= 364:
+                if c >= LOW:
                     found[x] = c
         k += 1
 pool = sorted(((c, x) for x, c in found.items()), reverse=True)

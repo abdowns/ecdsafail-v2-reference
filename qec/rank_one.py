@@ -37,6 +37,8 @@ choice, not the true floors one level down: any choice that keeps the invariant 
 
 The middle cells use the tree's add-or-shift and held offset on wider words. The last cell is
 semantic (a B1 doubles, adding nothing), so the reduced tick after it starts with no held lane."""
+from itertools import permutations
+
 from .arith import _maj, _uma, add_const, cswap
 from .two_bit import Prefix, TwoBitMod
 
@@ -176,26 +178,50 @@ def _csd(c):
     return out
 
 
+def _times_plan(c, W, top, nx):
+    """The order of c's signed digits and the top bit of each row's add, for x <= top on nx wires.
+    The first digit is a copy. While every partial sum is a positive multiple of x under 2^W, a row
+    stops at the top bit of the larger of the sums around it. The order with the fewest add bits
+    wins, then the one that zero-extends x the least."""
+    terms = [t for t in _csd(c) if t[0] < W]
+
+    def rows(order):
+        coef, exact, ends = 1 << order[0][0], True, []
+        for s, d in order[1:]:
+            new = coef + d * (1 << s)
+            exact = exact and new > 0 and max(coef, new) * top < 1 << W
+            ends.append((max(coef, new) * top).bit_length() if exact else W)
+            coef = new
+        return ends
+
+    def cost(order):
+        ends = rows(order)
+        bits = [e - s for (s, _), e in zip(order[1:], ends)]
+        return sum(bits), max([b - nx for b in bits] + [0])
+
+    orders = [terms]
+    if len(terms) <= 7:
+        orders = [list(o) for o in permutations(terms) if o[0][1] > 0]
+    order = min(orders, key=cost)
+    if order[0][1] < 0:
+        order = sorted(order, key=lambda t: t[1] < 0)
+    return order, rows(order)
+
+
 def _times(C, x, out, c, inverse, top):
     """out += c*x mod 2^len(out), out 0 before and x <= top: a copy at one +1 digit of c, an add or
-    subtract at each other. Until the first subtract the sum is under a known bound, and an add
-    stops at the bound's top bit."""
+    subtract at each other, as _times_plan orders and bounds them."""
     W = len(out)
-    terms = [t for t in _csd(c) if t[0] < W]
-    pivot = next(t for t in terms if t[1] > 0)
-    rest = [t for t in terms if t is not pivot]
-    s0 = pivot[0]
-    bound, ends = top << s0, []
-    for s, d in rest:
-        bound = bound + (top << s) if d > 0 and bound is not None else None
-        ends.append(W if bound is None else min(W, bound.bit_length()))
+    order, ends = _times_plan(c, W, top, len(x))
+    s0 = order[0][0]
+    rest = list(zip(order[1:], ends))
     if not inverse:
         for i, w in enumerate(x[:W - s0]):
             C.cx(w, out[s0 + i])
-        for (s, d), e in zip(rest, ends):
+        for (s, d), e in rest:
             (add if d > 0 else sub)(C, x[:e - s], out[s:e])
     else:
-        for (s, d), e in reversed(list(zip(rest, ends))):
+        for (s, d), e in reversed(rest):
             (sub if d > 0 else add)(C, x[:e - s], out[s:e])
         for i, w in enumerate(x[:W - s0]):
             C.cx(w, out[s0 + i])

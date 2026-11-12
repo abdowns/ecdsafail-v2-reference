@@ -89,9 +89,9 @@ def ys(U, V):
         hi0 = max(0, (c << i) - 1 + rng.choice([-1, 0, 0, 1]))
         return max(0, min(q - 1, ((hi0 << 256) + rng.randrange(1 << 256)) // d))
     if r < .9:
-        # a quotient k with f_lo*k just above a multiple of a power of two: the fold's borrow runs long
+        # a quotient k with 977*k or f*k just above a multiple of a power of two: the fold's borrow runs long
         d = rng.choice([x for x in (U, V) if x] or [1])
-        flo = 977
+        flo = rng.choice([977, (1 << 32) + 977])
         i = rng.randint(10, max(10, (flo * d).bit_length() - 1))
         j = rng.randint(1, max(1, flo * d >> i))
         k = -(-(j << i) // flo) + rng.choice([-1, 0, 0, 0, 1])
