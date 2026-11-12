@@ -1,0 +1,15 @@
+{"q": 7, "ticks": 5, "rank_cells": 0, "swap_wires": 3, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 13, "ticks": 6, "rank_cells": 0, "swap_wires": 4, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 31, "ticks": 8, "rank_cells": 4, "swap_wires": 3, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 61, "ticks": 9, "rank_cells": 3, "swap_wires": 5, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 127, "ticks": 11, "rank_cells": 6, "swap_wires": 4, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 251, "ticks": 12, "rank_cells": 4, "swap_wires": 7, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 509, "ticks": 14, "rank_cells": 7, "swap_wires": 6, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 1021, "ticks": 15, "rank_cells": 7, "swap_wires": 7, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 2039, "ticks": 17, "rank_cells": 7, "swap_wires": 9, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"q": 4093, "ticks": 18, "rank_cells": 9, "swap_wires": 8, "raw_bad": 0, "old_bad": 0, "chain_bad": 0, "forward_bad": 0, "inverse_bad": 0}
+{"mutant": "no-ccx", "caught": true, "bad_lanes": {"31": 310, "61": 1708, "127": 6856, "251": 40562}}
+{"mutant": "no-toggle", "caught": true, "bad_lanes": {"31": 310, "61": 1708, "127": 6858, "251": 40662}}
+{"mutant": "no-restore", "caught": true, "bad_lanes": {"31": 1860, "61": 7320, "127": 32004, "251": 125500}}
+{"mutant": "no-unsweep", "caught": true, "bad_lanes": {"31": 372, "61": 1708, "127": 9652, "251": 42670}}
+{"primes": 10, "start_shapes": [false, true], "ok": true}

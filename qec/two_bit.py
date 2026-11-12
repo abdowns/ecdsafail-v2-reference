@@ -289,8 +289,17 @@ class TwoBitMod(Mod):
         for w in prev:
             C.x(w)
 
-    def _drop_after_b1(self, C, prev, p):
-        if prev is not None:
+    def _drop_after_b1(self, C, prev, p, tape=False):
+        """Clear the mark p = [prev is B1]. With tape, p is prev's swap wire, where the tick before
+        formed the mark as 1 ^ g0 ^ b ^ s from that cell's g0 and swept b: X and CX turn it back
+        into s."""
+        if prev is None:
+            return
+        if tape:
+            C.x(p)
+            C.cx(prev[0], p)
+            C.cx(prev[1], p)
+        else:
             self._mark_b1(C, prev, p)
             C.free([p])
 
@@ -366,7 +375,36 @@ class TwoBitMod(Mod):
         C.free([cin, D])
         return hn, t
 
-    def _last_tick(self, C, prev, g, a, s, held):
+    def _sweep_in(self, C, g0, b, sw, up, nxt, tog):
+        """The B1 sweep's step into this cell, on an unswept tape read top down.
+
+        Sweep step k swaps b_k and b_(k-1) when g0_k = g0_(k-1) = 0. A B1 is followed by a
+        subtract, so the lower of two no-subtract cells is a J and b_(k-1) is 1: the step toggles
+        both bits by t_k = NOT g0_k AND NOT g0_(k-1) AND NOT x_k, with x_k = b_k XOR t_(k+1) this
+        cell's bit after the step above. tog holds t_(k+1) on entry, b holds x_k and sw = g0_k AND
+        x_k. t_(k+1) = NOT g0_(k+1) AND B1_k for B1_k = NOT g0_k AND NOT x_k, because x_k = 0
+        when t_(k+1) is 1, so t_k = t_(k+1) XOR B1_k AND (g0_(k-1) XOR g0_(k+1)), one CCX. up is
+        g0_(k+1), or None where no step above reaches this cell: tog is then 0 and g0_(k+1) is
+        taken as 1, which makes the CCX the definition of t_k. On return tog holds t_k and b the
+        swept bit x_k XOR t_k; sw is unchanged, as t_k implies NOT g0_k."""
+        C.x(sw)
+        C.cx(g0, sw)
+        C.cx(b, sw)
+        if up is None:
+            C.x(nxt)
+        else:
+            C.cx(up, nxt)
+        C.ccx(sw, nxt, tog)
+        if up is None:
+            C.x(nxt)
+        else:
+            C.cx(up, nxt)
+        C.cx(b, sw)
+        C.cx(g0, sw)
+        C.x(sw)
+        C.cx(tog, b)
+
+    def _last_tick(self, C, prev, g, a, s, held, tog=None, tape=False):
         """Cell 0's tick, where g0 implies b. The pass ends with R = 0, so on entry a J or B1 lane
         has R = 0 and a subtract lane has 2T + R = 0 mod q, or 2H - R = 0 mod q when held. The
         result on a subtract lane is then R itself, made from S alone with no add:
@@ -382,9 +420,19 @@ class TwoBitMod(Mod):
         g0, b = g
         p, spill, high = held
         if prev is None:
-            C.free([p])
+            if p is not None:
+                C.free([p])
             p = None
         word = s + [spill, high]
+        if tog is not None:
+            C.cx(tog, b)
+            if prev is not None:
+                # t_1 = NOT g0_1 AND B1_0, and B1_0 = NOT x_0 because g0_0 implies x_0. t_0 = 0.
+                C.x(b)
+                C.x(prev[0])
+                C.ccx(b, prev[0], tog)
+                C.x(prev[0])
+                C.x(b)
         C.cx(g0, b)
         for i in reversed(range(n)):
             cswap(C, b, [word[i]], [word[i + 1]])
@@ -513,7 +561,7 @@ class TwoBitMod(Mod):
             if not f >> 1 & 1:
                 C.cx(k0, low[1])
         C.free([z])
-        self._drop_after_b1(C, prev, p)
+        self._drop_after_b1(C, prev, p, tape)
         C.ccx(b, low[1], k1)
         if f >> 1 & 1:
             C.ccx(b, k0, k1)
@@ -522,7 +570,8 @@ class TwoBitMod(Mod):
         s[:] = s[-1:] + s[:-1]
         return None
 
-    def tick(self, C, prev, g, nxt, a, s, pebble=False, held=None, cell0=False, tau=None):
+    def tick(self, C, prev, g, nxt, a, s, pebble=False, held=None, cell0=False, tau=None, tog=None,
+             sw=None, tape=False):
         """One tick of a swept tape. prev is the cell before, or None on the first tick.
         nxt is the next cell's g0 wire, or None on the last tick, whose B1 reduces normally.
 
@@ -533,21 +582,38 @@ class TwoBitMod(Mod):
         subtract always swaps). It has its own tick, _last_tick.
         tau, when given, is a wire with S = tau*R on entry and no held lane: the tick after the
         pass's terminal cell, with tau that cell's g0.
+        tog, when given, carries the B1 sweep through an unswept tape: it holds the toggle the
+        sweep step above leaves on this cell, and on return the one this cell's step leaves on the
+        next, or 0 after cell 0. See _sweep_in.
+        With tape, each cell's swap bit s = g0 AND b sits on a wire of its own: sw is this cell's,
+        read in place of a computed one, and [this cell is B1] is formed on it in place. held's
+        first wire is then the previous cell's swap wire holding its mark, which this tick turns
+        back into that cell's s with X and CX instead of clearing it with a CCX; it is None on a
+        first tick.
         Returns the three wires to hand to the next tick, or None when nxt is None.
         sw and [prev is B1] each stay on one wire for the whole tick."""
         if cell0:
-            return self._last_tick(C, prev, g, a, s, held)
+            return self._last_tick(C, prev, g, a, s, held, tog, tape)
         n, f, w = self.n, self.f, self.window
         g0, b = g
         p, spill, high = held
         if prev is None:
-            C.free([p])
+            if p is not None:
+                C.free([p])
             p = None
         word = s + [spill, high]
         if tau is not None:
             (rtop,) = C.alloc(1)
             C.cx(s[n - 1], rtop)
-        sw = self._begin(C, g0, b)
+        if tog is None:
+            sw = self._begin(C, g0, b)
+        else:
+            C.cx(tog, b)
+            if not tape:
+                (sw,) = C.alloc(1)
+                C.ccx(g0, b, sw)
+            self._sweep_in(C, g0, b, sw, prev[0] if prev else None, nxt, tog)
+            C.cx(sw, b)
         if p is not None:
             for x in word:
                 C.cx(p, x)
@@ -676,7 +742,7 @@ class TwoBitMod(Mod):
             bit_one(k0r0)
             C.ccx(L[0], k0, k0r0)
             C.free([k0r0])
-        self._drop_after_b1(C, prev, p)
+        self._drop_after_b1(C, prev, p, tape)
         C.cx(sw, b)
         C.ccx(b, low[1], k1)
         if f >> 1 & 1:

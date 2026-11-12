@@ -7,6 +7,7 @@ The merged path now uses the paired-tick contract D1-D4 in [the mux proof](docs/
 The additional sweep rotates each no-subtract run so B1 is last in Bézout order.
 It runs in Euclid's tail, one cell behind the offset sweep, with which it commutes: the offset sweep's swap acts only on b of g0 = 1 cells, and each B1 step only on b of two g0 = 0 cells.
 So Euclid hands Bézout the B1-swept tape, and inverse Euclid unsweeps it before undoing its steps; this supersedes the placement in S2's last sentence and S17's last sentence of the mux proof, not the maps they state.
+With a raw tape that placement has moved again: "The B1 sweep inside the Bézout ticks", at the end of this file, runs the sweep in the Bézout pass and the unsweep in `_body`, and the Euclid pass leaves the tape unswept.
 The tape at rest is block-coded, two wires freed per 15 ticks by `qec/tape_block.py`; on the swept tape every B1 follows a subtract cell in tape order, so the code reads each block's cells last first and relies on the same clause.
 Cells read previous-symbol wires and can write the next g0 across a block edge, so Bézout decodes a block one tick before its first tick and codes it again one tick after its last, and two blocks are decoded across each edge for two ticks.
 The gate's toy primes have at most one block, so the edge path is covered by `scripts/block_check.py` at 20 bits and above and by the secp256k1 rows, not by a toy instance.
@@ -493,3 +494,75 @@ After the initial flag CX gates, the c = 0 words are 0000, 0110 and 0101.
 None has f0 = 0 and f1 = 1, so f0 XOR f1 equals f0 AND NOT f1 on that domain.
 The recode toggles gen with NOT c AND (f0 XOR f1), temporarily forming and restoring the XOR.
 This uses one CCX without a temporary, saving eight CCX across the four recodes.
+
+## The B1 sweep inside the Bézout ticks
+
+On the merged path with a raw tape (`DialogMultiplier.inline_sweep`), the Euclid pass no longer sweeps B1.
+It hands the Bézout pass the tape as its ticks wrote it, the Bézout pass sweeps each cell as it reads it, and `_body` unsweeps the tape after the pass, before the inverse Euclid pass.
+The map the Bézout pass applies to a swept tape is unchanged.
+The construction is PR #28's (`lowt-depth`, ab-godder), fitted here to the rank-one start, the tick after the terminal cell and the cut at cell 0, none of which PR #28 has.
+
+**The sweep as a chain.**
+Sweep step k swaps b_k and b_(k-1) when g0_k = g0_(k-1) = 0, for k from T - 2 down to 1, which is the Bézout pass's order.
+A single strip (B1) is followed by a subtract, so of two adjacent no-subtract cells the lower one is a double strip (J) and has b_(k-1) = 1.
+Step k therefore toggles both bits by t_k = NOT g0_k AND NOT g0_(k-1) AND NOT x_k, where x_k = b_k XOR t_(k+1) is b_k after step k + 1.
+When t_(k+1) = 1, x_k = 0; and when g0_(k+1) = g0_k = 0, b_k = 1. So t_(k+1) = NOT g0_(k+1) AND B1_k with B1_k = NOT g0_k AND NOT x_k, and
+
+    t_k = t_(k+1) XOR B1_k AND (g0_(k-1) XOR g0_(k+1)).
+
+A wire `tog` carries t_(k+1) into tick k (`TwoBitMod._sweep_in`).
+The tick XORs it into b, which makes x_k, and takes sw = g0 AND x_k.
+Then sw XOR g0 XOR b XOR 1 is B1_k, formed on the sw wire by X and CX, and one CCX against g0_(k+1) XOR g0_(k-1), formed on the next cell's g0 wire by CX, moves `tog` to t_k.
+`tog` XORs into b again, which leaves the swept bit x_k XOR t_k.
+sw is still g0 AND b, because t_k implies NOT g0_k.
+The rest of the tick reads the swept cell as before, and step k's toggle of b_(k-1) is the next tick's first XOR.
+At cell 0, g0 implies b, so B1_0 = NOT x_0, t_0 = 0, and one CCX, `tog` ^= NOT g0_1 AND NOT x_0, clears the wire.
+
+**Where the chain starts.**
+Where no step above has left a toggle on a cell, `tog` is 0 and the tick takes g0_(k+1) as 1; the CCX is then t_k = B1_k AND NOT g0_(k-1), which is t_k's definition.
+That is the first general tick in both start shapes.
+Without a rank-one start it is cell T - 2: step T - 1 never swaps, by "Sweep endpoint identities".
+With a rank-one start of J cells, the start reads cells T - 1 to T - J swept, so `_bezout_pass` first runs steps T - 2 down to T - J in the old form (`_b1_sweep` with `lo = T - J`: a controlled swap and a mark transition a step, and one CCX to clear the mark at the end).
+Step T - J swaps b_(T-J) and b_(T-J-1), so cell T - J - 1 enters its tick as x_(T-J-1), with `tog` = 0.
+The first general tick has no previous cell in both shapes, so the tick reads g0_(k+1) from `prev` and needs no extra argument.
+
+**The unsweep.**
+The ticks' other gates leave every g0 and b wire as they found it, so the tape the pass leaves is the swept one, cell by cell.
+`_body` then applies the inverse of the sweep and the tape is the one the inverse Euclid pass expects.
+Without swap wires that inverse is `_b1_sweep` reversed, 2 CCX a step.
+
+Per M this removes the sweep from both Euclid passes and adds one CCX to each general tick, the explicit steps of the rank-one cells, and one wire that is live through the Bézout pass.
+At G: 2,961,008 -> 2,960,272 CCX (-736), T 20,727,056 -> 20,721,904, 4,096 wires, `CARRY_JUNK` unchanged at 1,161 because the Bézout pass is not the wire peak.
+The Euclid pass keeps a `sweep` flag, on by default, so `model_check.py` and `utape_check.py` still check the swept pass; `_bezout_pass` takes `inline`, off by default, for the same reason.
+
+## Swap bits on tape wires
+
+With the inline sweep, each cell that a general Bézout tick reads, except cell 0, has one more wire, zero when M starts, that holds the cell's swap bit s = g0 AND b from its Euclid step to the inverse pass (`DialogMultiplier.SWAP_WIRES`, `swap_width` wires for cells 1 to `sweep_top`).
+This too is PR #28's construction.
+
+The Euclid step writes it with one CX from g1, right after g1 goes to b: g1 is the swap on a subtract and 0 elsewhere, so it is g0 AND b.
+The inverse step, the same block reversed, clears it with that CX.
+The rank-one cells need none, because their ticks are not the general tick; cell 0 needs none, because tick 0 always swaps and the cell-0 tick uses g0 for sw.
+
+In the Bézout pass, tick k reads the wire where it used to compute sw = g0 AND x_k onto a fresh wire.
+The two are equal: x_k = b_k XOR t_(k+1), and t_(k+1) implies NOT g0_k, so the sweep never changes a subtract cell's bit.
+The tick forms [cell k is B1] = 1 XOR g0 XOR b XOR sw on that wire, as it did on the fresh one, and tick k - 1 reads it as its held mark.
+Where tick k - 1 used to clear the mark with a CCX and free the wire, it now applies X, CX from g0_k and CX from b_k, which return the wire to s_k.
+Tick k - 1 writes neither g0_k nor b_k, and b_k is the swept bit both times, so the wire is exact; cell 0's tick restores cell 1's.
+The register the ticks hand on is then H's two top bits alone.
+
+The unsweep is the inverse of `_sweep_sw`, which applies to the tape and `tog` the gates the pass applied to them: the rank-one start's explicit steps, then for each cell from `sweep_top` down, b_k ^= `tog`, `_sweep_in` with the swap wire, and cell 0's clearing CCX.
+With s on a wire, B1_k = 1 XOR g0 XOR x XOR s is linear, so this sweep is one CCX a cell where `_b1_sweep` is two.
+
+Per M and cell this removes the tick's sw CCX, its mark-clearing CCX and one unsweep CCX: 3 CCX, or 6 a point addition, against 4 CCX for the wire at the junk rate.
+The 369 swap wires at n = 256 take `CARRY_JUNK` from 1,161 to 792.
+At G: 2,960,272 -> 2,959,536 CCX (-736), T 20,721,904 -> 20,716,752, 4,096 wires.
+
+The trade is at the junk rate's edge by construction, and the variants that reuse an existing wire come out equal, not better.
+The retired-offset wire of each Euclid step holds g0 AND (the swap of the subtract before), so the swap bits are already on wires, one subtract late.
+Bringing each to its own cell takes a running offset and a controlled swap a cell on the way down and another on the way back: 2 CCX a cell and M, 4 a point addition, which is the price of the wire it saves.
+Writing the offset onto a fresh wire each tick instead of retiring it gives the same count.
+
+`scripts/sweep_check.py` (accept's `I2.sweep`) checks both sections at gate level on ten primes from 7 to 4,093, with and without a rank-one start, over every x: the unswept pass against `tick_tape`, both sweeps against a model that shares no code with the circuit, the swap wires before and after, and M and its inverse.
+Four mutants must each fail it: `_sweep_in` without its CCX, without its last CX, the mark restore without its X, and no unsweep.
+`DialogMultiplier.INLINE_SWEEP = False` and `SWAP_WIRES = False` restore the previous constructions.

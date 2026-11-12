@@ -4,13 +4,13 @@
   "q": "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
   "addend": "secp256k1 G",
   "n": 256,
-  "wires": 1803,
-  "ops": 13378277,
+  "wires": 4096,
+  "ops": 10829431,
   "counts": {
-   "X": 2253198,
-   "CX": 6215328,
-   "CCX": 4908983,
-   "SWAP": 768
+   "X": 1625318,
+   "CX": 6244577,
+   "CCX": 2959536,
+   "SWAP": 0
   },
   "lanes": 252,
   "special_cases": [
@@ -23,7 +23,7 @@
   ],
   "failures": 0,
   "first_failures": [],
-  "build_seconds": 4.0,
-  "sim_seconds": 0.9
+  "build_seconds": 4.6,
+  "sim_seconds": 0.8
  }
 ]

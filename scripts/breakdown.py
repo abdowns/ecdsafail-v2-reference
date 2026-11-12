@@ -30,13 +30,15 @@ def euclid_only(C, X, Y):
     U = C.alloc(n)
     load_const(C, U, mod.q)
     pool = list(X) + C.alloc(M.tape_external)
-    M._euclid_pass(U, pool, C.alloc(M.junk_width))
+    # As the body runs it: unswept when the Bezout pass sweeps inline, and with the swap wires.
+    M._euclid_pass(U, pool, C.alloc(M.junk_width), sweep=not M.inline_sweep,
+                   swr=C.alloc(M.swap_width) or None)
 
 
 def bezout_only(C, Y, S, G):
-    # The pass reads the coded tape; the B1 sweep now runs in Euclid's tail.
+    # The pass reads the tape as the body's Euclid pass leaves it, and sweeps B1 itself when inline.
     M = DialogMultiplier(C, mod)
-    M._bezout_pass(M.with_free_slots(G), Y, S)
+    M._bezout_pass(M.with_free_slots(G), Y, S, inline=M.inline_sweep, swr=C.alloc(M.swap_width) or None)
 
 
 def mulsub(C, g, X, Y):

@@ -45,6 +45,7 @@ ALLOWED_GATES = {"X", "CX", "CCX", "SWAP"}
 REFERENCE = {"commit": "8ca9b0e", "sample_max_t": 50_465_989, "wires": 2311}
 COVERAGE = {"model_primes": 13, "toy_instances": 36, "toy_lanes": 25_800,
             "components": 52, "component_lanes": 13_867,
+            "sweep_primes": 10, "sweep_mutants": 4,
             "mutation_trials": 200, "mutations_caught_at_least": 163, "secp_special_points": 6}
 G_MULTIPLES = tuple(range(1, 9))
 SECP_RANDOM_POINTS = {True: 8, False: 120}
@@ -184,6 +185,7 @@ class Run:
             "toy-hier": [["check.py", *TOY_ARGS, "--hier", "--out", w / "toy_exhaustive_hier.json"]],
             "components": [["component_check.py"]],
             "mutation": [["mutation_control.py"]],
+            "sweep": [["sweep_check.py"]],
             "secp-hier": [["check.py", "--secp", "--hier", "--secp-addend", *map(hex, c), "--secp-random", self.secp_points,
                            "--seed", seed, "--out", w / f"secp256k1_hier_{i}.json"] for i, c in enumerate(chunks)],
             **{f"emit:{name}": [["emit.py", *args, "--out", w / "emit" / filename]] for name, (filename, args) in EMITS.items()},
@@ -418,6 +420,25 @@ def i2_mutation(run):
     return Result(FAIL if problems or caught < need else PASS, note, evidence)
 
 
+def i2_sweep(run):
+    p, = run.procs("sweep")
+    rows = json_lines(p.stdout)
+    primes = [r for r in rows if "q" in r]
+    mutants = [r for r in rows if "mutant" in r]
+    last = rows[-1] if rows else {}
+    bad = [r["q"] for r in primes if any(v for k, v in r.items() if k.endswith("_bad"))]
+    missed = [r["mutant"] for r in mutants if not r["caught"]]
+    problems = [f"exit {p.rc}, see {p.log}"] * bool(p.rc or not last.get("ok"))
+    problems += coverage("primes", len(primes), "sweep_primes") + coverage("mutants", len(mutants), "sweep_mutants")
+    if bad:
+        problems.append(f"failing primes {bad}")
+    if missed:
+        problems.append(f"mutants not caught: {missed}")
+    note = "; ".join(problems) or (f"{len(primes)} primes, every x: the unswept pass, both sweeps and the swap wires match the model, "
+                                   f"M and its inverse are right; {len(mutants)} of {len(mutants)} sweep mutants fail")
+    return Result(FAIL if problems else PASS, note, {"exit": p.rc, "rows": rows, "log": p.log})
+
+
 def i2_secp(run):
     procs, rows = run.secp_hier()
     lanes = 2 * (COVERAGE["secp_special_points"] + run.secp_points)
@@ -580,6 +601,7 @@ CHECKS = (
     Check("I2.toy-hier", "exactness: same check on the hierarchical upload", i2_toy_hier, ("toy-hier", "emit:toy127.hier")),
     Check("I2.components", "exactness: 256-bit components on boundary inputs", i2_components, ("components",)),
     Check("I2.mutation", "exactness: the checker rejects mutated circuits", i2_mutation, ("mutation",)),
+    Check("I2.sweep", "exactness: the B1 sweep inside the Bezout ticks and the swap wires", i2_sweep, ("sweep",)),
     Check("I2.secp", "exactness: 256-bit hierarchical upload on exceptional and random points", i2_secp, ("secp-hier", "emit:secp256k1_G.hier")),
     Check("I2.secp-flat", "exactness: 256-bit flat circuit at G", i2_secp_flat, ("secp-flat",), full_only=True),
     Check("I3", "gate set: X, CX, CCX, SWAP only", i3_gate_set, ("toy", "secp-hier", "secp-flat") + EMIT_JOBS),

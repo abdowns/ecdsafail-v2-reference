@@ -24,6 +24,7 @@ timed_to() {
 $PY -I scripts/model_check.py > receipts/model_check.jsonl
 $PY -I scripts/check.py --toy-bits 4 6 7 8 9 10 --toy-per-size 6 --out receipts/toy_exhaustive.json > /dev/null
 $PY -I scripts/mutation_control.py > receipts/mutation_control.json
+$PY -I scripts/sweep_check.py > receipts/sweep_check.jsonl
 $PY -I scripts/component_check.py > receipts/secp256k1_components.json
 timed $PY -I scripts/check.py --secp --secp-random 120 --seed 2026 --out receipts/secp256k1_sampled.json > receipts/secp256k1_sampled.log 2>&1
 $PY -I scripts/breakdown.py > receipts/secp256k1_breakdown.json
