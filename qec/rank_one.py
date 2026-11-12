@@ -196,12 +196,12 @@ def _times(C, x, out, c, inverse):
             C.cx(w, out[s0 + i])
 
 
-def split(c, k):
-    """(c_lo, t) when c = 2^t + c_lo with c_lo*x < 2^t for every k-bit x, else None. Then c*x is
+def split(c, top):
+    """(c_lo, t) when c = 2^t + c_lo with c_lo*x < 2^t for every x <= top, else None. Then c*x is
     c_lo*x on its own wires and x itself at t."""
     t = c.bit_length() - 1
     lo_c = c - (1 << t)
-    return (lo_c, t) if lo_c << k <= 1 << t else None
+    return (lo_c, t) if lo_c * top < 1 << t else None
 
 
 class RankOne:
@@ -303,10 +303,12 @@ class RankOne:
         inc(C, hi, one)
         C.x(one)
         C.free([one])
-        cut = split(f, len(hi))
+        # hi + 1 <= 2^w, on w + 1 wires
+        top = 1 << len(hi) - 1
+        cut = split(f, top)
         if cut:
             lo_c, t = cut
-            low = C.alloc((lo_c * ((1 << len(hi)) - 1)).bit_length())
+            low = C.alloc((lo_c * top).bit_length())
             own = low + C.alloc(t - len(low))
             prod = own + hi
             assert len(prod) == W
@@ -781,6 +783,131 @@ class RankOne:
         mul_acc(C, V, r[:k], D)
         C.apply(b1, regs1, inverse=True)
         C.free(U + V + stash + D)
+        del R[n:], S[n:]
+
+
+    # -- the Euclid pass's copies ----------------------------------------------------------------------
+    #
+    # Level k's cofactors are the Euclid pair before tick T - k, but for V inside a shift run that
+    # the B1 sweep crossed, where the swept V is twice the pair's: there the tick below is a shift
+    # and v has an odd count of trailing zeros. The pass holds v as V + E on its offset.
+
+    def kept(self, keep):
+        """(stash, U_J above its low 1, V, E) of the kept wires."""
+        a = self.stash_size()
+        w = self.w
+        return keep[:a], keep[a:a + w - 1], keep[a + w - 1:a + 2 * w - 1], keep[a + 2 * w - 1]
+
+    def kept_size(self):
+        return self.stash_size() + 2 * self.w
+
+    def keep_state(self, C, k, U, V, E, keep):
+        """Before Euclid tick T - k: copy U, and at k = J also V and the offset."""
+        stash, UJ, VJ, EJ = self.kept(keep)
+        assert len(U) == self.m(k) and len(V) == self.m(k)
+        if k == self.J:
+            for x, y in zip(U[1:], UJ):
+                C.cx(x, y)
+            for x, y in zip(V, VJ):
+                C.cx(x, y)
+            C.cx(E[0], EJ)
+        else:
+            for x, y in zip(U[1:], self.stash_at(stash, k)):
+                C.cx(x, y)
+
+    def _odd_zeros(self, C, v, out):
+        """out ^= [v's count of trailing zeros is odd], the XOR of [v's low j bits are 0], j >= 1."""
+        for x in v:
+            C.x(x)
+        chain, z = [], v[0]
+        C.cx(z, out)
+        for x in v[1:]:
+            (a,) = C.alloc(1)
+            C.ccx(z, x, a)
+            C.cx(a, out)
+            chain.append(a)
+            z = a
+        prev = [v[0]] + chain[:-1]
+        for i in reversed(range(len(chain))):
+            C.ccx(prev[i], v[i + 1], chain[i])
+        C.free(chain)
+        for x in v:
+            C.x(x)
+
+    def _swept_v(self, C, VJ, EJ, below, inverse=False):
+        """A fresh register with the swept V_J: (V + E), doubled inside a crossed run. below is the
+        g0 of the cell under the start. inverse takes that register back to zero wires."""
+        def twice(V, d):
+            for i in range(len(V) - 1, 0, -1):
+                C.cx(V[i - 1], V[i])
+                C.ccx(d, V[i], V[i - 1])
+                C.cx(V[i - 1], V[i])
+
+        def flag(V, d):
+            (par,) = C.alloc(1)
+            self._odd_zeros(C, V, par)
+            C.x(below)
+            C.ccx(below, par, d)
+            C.x(below)
+            self._odd_zeros(C, V, par)
+            C.free([par])
+
+        if not inverse:
+            V = C.alloc(self.w)
+            (d,) = C.alloc(1)
+            for x, y in zip(VJ, V):
+                C.cx(x, y)
+            inc(C, V, EJ)
+            flag(V, d)
+            twice(V, d)
+            return V, d
+        V, d = inverse
+        for i in range(1, len(V)):
+            C.cx(V[i - 1], V[i])
+            C.ccx(d, V[i], V[i - 1])
+            C.cx(V[i - 1], V[i])
+        flag(V, d)
+        dec(C, V, EJ)
+        for x, y in zip(VJ, V):
+            C.cx(x, y)
+        C.free(V + [d])
+
+    def convert_kept(self, C, term, cells, R, S, keep, below):
+        """convert, with the cofactors read from the Euclid pass's copies."""
+        n, w, J = self.n, self.w, self.J
+        C.free(R[n + w:] + S[n + w:])
+        del R[n + w:], S[n + w:]
+        self.fold(C, R)
+        self.fold(C, S)
+        r, a, s, b = R[:n], R[n:], S[:n], S[n:]
+        flat = [term] + [x for c in cells for x in c]
+        stash, UJ, VJ, EJ = self.kept(keep)
+        (one,) = C.alloc(1)
+        C.x(one)
+        U = [one] + UJ
+        V, d = self._swept_v(C, VJ, EJ, below)
+        D = C.alloc(w + 1)
+        mul_acc(C, V, a, D)
+        mul_acc(C, U, b, D, sign=-1)
+        DG = D + C.alloc(self.pool_size())
+        regs2 = [flat, stash, DG]
+        b2 = C.run(lambda flat, stash, DG: self.d_descent(C, flat, stash, DG), regs2)
+        nd = 2 * (J - 1)
+        spare = len(DG) - nd
+        C.free(DG[nd:])
+        del DG[nd:]
+        self.k_descent(C, cells, DG, a, b)
+        DG += C.alloc(spare)
+        C.apply(b2, regs2, inverse=True)
+        D = DG[:w + 1]
+        C.free(DG[w + 1:])
+        k = w + 1
+        mul_odd_const(C, D, self.q % (1 << k))
+        mul_acc(C, U, s[:k], D, sign=-1)
+        mul_acc(C, V, r[:k], D)
+        self._swept_v(C, VJ, EJ, below, inverse=(V, d))
+        C.x(one)
+        C.free([one] + D)
         del R[n:], S[n:]
 
 

@@ -23,9 +23,9 @@ class DialogMultiplier:
     RAW_TAPE = True
     # Chain carries the forward pass leaves as junk for the inverse pass. Each is held through the
     # Bezout pass and saves one CCX in each Euclid pass, so this is the one knob that trades wires
-    # for CCX; 553 puts the circuit at 4,096 wires at n = 256, beside the 369 swap wires and the
-    # rank-one conversion's 239 wires above the Bezout ticks.
-    CARRY_JUNK = 553
+    # for CCX; 503 puts the circuit at 4,096 wires at n = 256, beside the 369 swap wires, the 253
+    # the pass keeps for the rank-one conversion, and that conversion's own.
+    CARRY_JUNK = 503
     # A tick whose registers reach this many bits above its joint threshold runs those bits as one
     # high word, 3 CCX a bit, on a flag that says which register holds it. At n = 256 a word of 2 bits
     # costs more whole than plain, and 4 or more loses the lazy run, which starts at a word of 3. 3 keeps
@@ -46,8 +46,11 @@ class DialogMultiplier:
     LAG_BLOCK = (15, 7, 3)
     LAG_MIN_SAVING = 1
     # The Bezout pass's first cells run on unreduced integers, up to this many, then one conversion
-    # (rank_one.py); 0 turns it off. At 21 the fold's product no longer splits (rank_one.split).
-    RANK_J = 20
+    # (rank_one.py); 0 turns it off. From 22 the fold's product no longer splits (rank_one.split).
+    RANK_J = 21
+    # The Euclid pass copies its last small states for the rank-one conversion, which then builds
+    # no cofactors of its own; the copies stay through the Bezout pass and the inverse pass clears them.
+    KEEP = True
     # (first, last): blocks only on these ticks. No real input still has U's word above the front where
     # the default run ends, so the exit swap's gate moves the run's ends to where built inputs do.
     LAG_SPAN = None
@@ -1075,8 +1078,11 @@ class DialogMultiplier:
         return max(self.sweep_top, 0) if self.SWAP_WIRES and self.inline_sweep else 0
 
     def _euclid_pass(self, U: list[int], pool: list[int], junk: list[int], block0_raw: bool = False,
-                     sweep: bool = True, swr: list[int] | None = None) -> None:
+                     sweep: bool = True, swr: list[int] | None = None, keep: list[int] | None = None) -> None:
         # swr, if given, starts zero and ends with the swap bits of cells 1 to len(swr).
+        # keep, if given, starts zero and ends with copies of the pass's last small states, which the
+        # Bezout pass's rank-one conversion reads: U before each of the last J ticks, and V and
+        # the offset before the first of them.
         # The pool starts as V plus clean external tape. It ends as the zero wires U did not
         # take back, then tape; U ends as its low wires and those zero wires. The boundary is a
         # permutation of U and the pool together. junk starts zero and ends holding each tick's
@@ -1089,10 +1095,14 @@ class DialogMultiplier:
         counter, ext, pending = self._lazy_width(plan), None, []
         strips, after, whole = [], [], False
         assert len(junk) == 1 + sum(sizes)
+        kept = self._rank(self.rank_j) if keep else None
         for i in range(self.iters):
             w = self.widths[i]
             assert (whole or len(V) == w) and len(available) >= 2
             cell, available = available[:2], available[2:]
+            if kept and 2 <= self.iters - i <= kept.J:
+                assert not whole and not (plan[i] and (plan[i][9] or plan[i][10]))
+                kept.keep_state(self.C, self.iters - i, U[:w], V, E, keep)
             if plan[i] is None:
                 self.C.apply(self._euclid_tick0(), [U, V, E, cell])
             else:
@@ -1315,7 +1325,7 @@ class DialogMultiplier:
         """Use the pass-wide mark while both cells are still raw."""
         cswap(self.C, both, [G[2 * i + 1]], [G[2 * i - 1]])
 
-    def _bezout_pass(self, G, Yr, S, block0_raw=False, inline=False, swr=None):
+    def _bezout_pass(self, G, Yr, S, block0_raw=False, inline=False, swr=None, keep=None):
         """G is the coded tape. Each block is decoded on a clean wire before a tick reads it and
         coded again once no tick reads it, except block 0 on the merged path with block0_raw.
         inline: G is unswept, and the pass sweeps it as it reads it. swr: the swap wires."""
@@ -1357,7 +1367,7 @@ class DialogMultiplier:
                 # The rank-one start reads cells T - 1 to T - J swept: steps T - 2 to T - J, the
                 # last of which leaves cell T - J - 1 as the sweep's next step finds it.
                 self._b1_sweep(G, T - J)
-            self._rank_start(G, Yr, S, J)
+            self._rank_start(G, Yr, S, J, keep)
         # The sweep's toggle starts at 0: no step above reaches the first tick's cell unswept.
         tog = C.alloc(1) if inline else []
         for i in reversed(range(T - J)):
@@ -1434,13 +1444,28 @@ class DialogMultiplier:
     def _rank_j(self, lend_tail, tail):
         if not (self.RANK_J and self.RAW_TAPE and lend_tail and not tail and not self.blocks):
             return 0
-        return rank_one.plan(self.mod.q, self.iters, self.widths, self.RANK_J)
+        J = rank_one.plan(self.mod.q, self.iters, self.widths, self.RANK_J)
+        if J and self.KEEP:
+            # The Euclid pass copies plain words: every lazy tick must be under the start.
+            lazy = [i for i, key in enumerate(self._tick_plan()) if key and (key[9] or key[10])]
+            J = min(J, self.iters - 1 - max(lazy, default=0))
+        return J if J >= 3 else 0
 
-    def _rank_start(self, G, Yr, S, J):
+    def _rank(self, J):
+        T = self.iters
+        return rank_one.RankOne(self.mod.q, J, self.widths[T - J], [1] + [self.widths[T - k] for k in range(1, J + 1)])
+
+    @property
+    def keep_width(self):
+        """Wires the Euclid pass fills for the rank-one conversion: see rank_one.RankOne.kept."""
+        J = self.rank_j
+        return self._rank(J).kept_size() if J and self.KEEP else 0
+
+    def _rank_start(self, G, Yr, S, J, keep=None):
         """Cells T - 1 down to T - J on unreduced integers, then one conversion. The tick after it
         is a first tick: the last cell here is semantic, so no lane is held."""
         C, T, n = self.C, self.iters, self.mod.n
-        ro = rank_one.RankOne(self.mod.q, J, self.widths[T - J], [1] + [self.widths[T - k] for k in range(1, J + 1)])
+        ro = self._rank(J)
         R, Sw = Yr + C.alloc(ro.L - n), S + C.alloc(ro.L - n)
         term = G[2 * T - 2]
         for r, s in zip(Yr, S):
@@ -1460,7 +1485,10 @@ class DialogMultiplier:
         i = T - J
         ro.last_tick(C, G[2 * i:2 * i + 2], G[2 * i + 2:2 * i + 4], p, R, Sw)
         cells = [G[2 * k:2 * k + 2] for k in range(T - 2, T - J - 1, -1)]
-        ro.convert(C, term, cells, R, Sw)
+        if keep:
+            ro.convert_kept(C, term, cells, R, Sw, keep, G[2 * (T - J - 1)])
+        else:
+            ro.convert(C, term, cells, R, Sw)
         Yr[:], S[:] = R, Sw
 
     def _body(self, Xr, Yr):
@@ -1475,9 +1503,10 @@ class DialogMultiplier:
         junk = C.alloc(self.junk_width)
         inline = self.inline_sweep
         swr = C.alloc(self.swap_width) if self.swap_width else None
-        regs = [U, pool, junk] + ([swr] if swr else [])
-        E = C.run(lambda U, pool, junk, *sw: self._euclid_pass(U, pool, junk, raw0, not inline,
-                                                               sw[0] if sw else None), regs)
+        keep = C.alloc(self.keep_width)
+        regs = [U, pool, junk, swr or [], keep]
+        E = C.run(lambda U, pool, junk, sw, keep: self._euclid_pass(U, pool, junk, raw0, not inline,
+                                                                    sw or None, keep), regs)
         if raw0:
             self._code_block0(U, pool)
         lent = self.lent_after_pass
@@ -1488,7 +1517,7 @@ class DialogMultiplier:
         # the surviving V wire stays zero for the inverse Euclid boundary.
         C.x(U[0])
         S = U
-        self._bezout_pass(G, Yr, S, raw0, inline, swr)
+        self._bezout_pass(G, Yr, S, raw0, inline, swr, keep)
         # Bezout swept the tape it read; the inverse pass needs it unswept.
         if swr:
             C.apply(C.record(self._sweep_sw, [G, swr]), [G, swr], inverse=True)
@@ -1508,10 +1537,10 @@ class DialogMultiplier:
             C.free([reg[i] for reg, i in places])
             for (reg, i), w in zip(places, raw):
                 reg[i] = w
-        C.apply(E, [Yr, pool, junk] + ([swr] if swr else []), inverse=True)
+        C.apply(E, [Yr, pool, junk, swr or [], keep], inverse=True)
         load_const(C, Yr, q)
         Xr[:] = pool[:n]
-        C.free(Yr + pool[n:] + junk + (swr or []))
+        C.free(Yr + pool[n:] + junk + (swr or []) + keep)
         Yr[:] = S
 
     def _cell0_cut(self, prev, g, R, S, flag, pebble, tog=(), psw=(), tape=False):
