@@ -255,17 +255,199 @@ def _lookahead_tree(C, U, V, q, r):
             q.give(T.pop(j))
 
 
+def geo_sizes(m, lo, hi, cap):
+    """Block sizes for m bits, bottom up: 1 at each end, growing by the factor lo a block from the
+    bottom and hi a block from the top, none above cap; blocks of cap fill the middle, and what is
+    left over joins the bottom ramp."""
+    ends, grow, left = ([], []), (lo, hi), m
+    x = [1.0, 1.0]
+    live = [bool(lo), bool(hi)]                         # a ratio of None leaves that ramp out
+    while any(live):
+        for i in (0, 1):
+            r = min(cap, int(round(x[i])))
+            if live[i] and r < cap and left >= r + (cap if live[1 - i] else 0):
+                ends[i].append(r)
+                left -= r
+                x[i] *= grow[i]
+            else:
+                live[i] = False
+    mid = [cap] * (left // cap)
+    left -= sum(mid)
+    if left:
+        ends[0].append(left)                            # where the bottom ramp has that size
+        ends[0].sort()
+    out = ends[0] + mid + ends[1][::-1]
+    assert sum(out) == m and all(r >= 1 for r in out)
+    return out
+
+
+def tree_shape(r, fan, leaf):
+    """A block of r bits as a tree: 1 is one bit, an int a run of that many bits under one node,
+    a list a node's kids."""
+    if r <= leaf:
+        return r
+    g = min(fan, -(-r // leaf))
+    return [tree_shape(r // g + (i < r % g), fan, leaf) for i in range(g)]
+
+
+def tree_node(s, shape):
+    if shape == 1:
+        return {"s": s, "e": s + 1, "kids": None}
+    kids, at = [], s
+    for sh in ([1] * shape if isinstance(shape, int) else shape):
+        kids.append(tree_node(at, sh))
+        at = kids[-1]["e"]
+    return {"s": s, "e": at, "kids": kids}
+
+
+def carry_trees(m, spec):
+    lo, hi, cap, fan, leaf = spec
+    out, s = [], 0
+    for r in geo_sizes(m, lo, hi, cap):
+        out.append(tree_node(s, tree_shape(r, fan, leaf)))
+        s += r
+    return out
+
+
+class CarrySweep:
+    """The carries U[j + 1] ^= U[j] * P[j], j = 0 .. m - 1, in place on U, over blocks that are trees.
+
+    Each U[j + 1] is affine in U[j], so over any span U[e] = local ^ U[s] * AND(P[s .. e-1]), local
+    being what the span leaves on U[e] from U[s] = 0. A node joins its kids' spans: the later kids'
+    local values chain through the kids' products, and prefix products of those (on temps) fix each
+    kid's first wire once the node's own first wire is true. forward(root) makes one block's
+    carries true from a true U[s] and clears its products. backward(root) is the same block
+    undone from true carries, in the order that suits a sweep running down the word: the products
+    again, the fixes undone deepest first, the block's step, then the local chains and the
+    products from the root down. A block of r bits costs 4r - 3 CCX whatever its tree.
+    """
+
+    def __init__(self, C, U, P, take, give):
+        self.C, self.U, self.P, self.take, self.give = C, U, P, take, give
+
+    def beta(self, node):
+        return self.P[node["s"]] if node["kids"] is None else node["Q"][-1]
+
+    def products(self, node):
+        kids = node["kids"]
+        for k in kids:
+            if k["kids"]:
+                self.products(k)
+        Q = [self.beta(kids[0])]
+        for k in kids[1:]:
+            Q.append(self.take())
+            self.C.ccx(Q[-2], self.beta(k), Q[-1])
+        node["Q"] = Q
+
+    def clear(self, node):
+        kids, Q = node["kids"], node["Q"]
+        for i in reversed(range(1, len(kids))):
+            self.C.ccx(Q[i - 1], self.beta(kids[i]), Q[i])
+            self.give(Q[i])
+
+    def up(self, node):
+        C, U = self.C, self.U
+        kids = node["kids"]
+        for k in kids:
+            if k["kids"]:
+                self.up(k)
+        # The products first: the node above waits for the last one, and both gates hold beta(k).
+        Q = [self.beta(kids[0])]
+        for k in kids[1:]:
+            Q.append(self.take())
+            C.ccx(Q[-2], self.beta(k), Q[-1])
+        node["Q"] = Q
+        for k in kids[1:]:
+            C.ccx(self.beta(k), U[k["s"]], U[k["e"]])   # the node's local chain
+
+    def down(self, node):
+        # U[s] is true: fix each later kid's first wire, top down, then clear, then the kids.
+        C, U = self.C, self.U
+        kids, Q, s = node["kids"], node["Q"], node["s"]
+        for i in reversed(range(1, len(kids))):
+            C.ccx(U[s], Q[i - 1], U[kids[i]["s"]])
+        self.clear(node)
+        for k in kids:
+            if k["kids"]:
+                self.down(k)
+
+    def unfix(self, node):
+        C, U = self.C, self.U
+        kids, s = node["kids"], node["s"]
+        for k in kids:
+            if k["kids"]:
+                self.unfix(k)
+        for i in range(1, len(kids)):
+            C.ccx(U[s], node["Q"][i - 1], U[kids[i]["s"]])
+
+    def unlocal(self, node):
+        C, U = self.C, self.U
+        kids = node["kids"]
+        for k in reversed(kids[1:]):
+            C.ccx(U[k["s"]], self.beta(k), U[k["e"]])
+        self.clear(node)
+        for k in kids:
+            if k["kids"]:
+                self.unlocal(k)
+
+    def forward(self, root):
+        C, U, s, e = self.C, self.U, root["s"], root["e"]
+        if root["kids"] is None:
+            C.ccx(U[s], self.P[s], U[e])
+        else:
+            self.up(root)
+            C.ccx(U[s], self.beta(root), U[e])          # the chain step
+            self.down(root)
+
+    def backward(self, root):
+        C, U, s, e = self.C, self.U, root["s"], root["e"]
+        if root["kids"] is None:
+            C.ccx(U[s], self.P[s], U[e])
+        else:
+            self.products(root)
+            self.unfix(root)
+            C.ccx(U[s], self.beta(root), U[e])
+            self.unlocal(root)
+
+
+# lookahead_sweep as a chain of trees: (least len(U), carry_trees' (lo, hi, cap, fan, leaf)) rows,
+# the first that fits, or None for the Brent-Kung tree below. The chain's S blocks cost 4m - 3S
+# CCX and need m - S temps to run abreast. Narrow sweeps want a lower cap: the ramps are most of
+# the word there, and a block larger than what is left after them only adds depth.
+SWEEP_GEO = ((190, (2, 2, 64, 2, 2)), (70, (2, 2, 32, 2, 2)), (10, (2, 2, 16, 2, 2)))
+
+
+def _geo_spec(n):
+    for least, spec in SWEEP_GEO or ():
+        if n >= least:
+            return spec
+    return None
+
+
+def lookahead_geo(C, U, V, temps, spec):
+    """lookahead_chain's map over carry_trees' blocks, each block on temps of its own while they last."""
+    q = _TempQueue(temps)
+    sweep = CarrySweep(C, U, V[1:], q.take, q.give)
+    for root in carry_trees(len(U) - 1, spec):
+        sweep.forward(root)
+
+
 # Block sizes lookahead_sweep tries, in order. Blocks of 1 make the tree a plain Brent-Kung prefix
 # over the bits, with each p on its V wire: fewer CCX and fewer ticks than blocks of 3, for about
 # len(U) temps instead of 2 len(U) / 3.
 SWEEP_BLOCKS = (1, 2, 3, 4, 5, 6, 8)
 
 
-def lookahead_sweep(C, U, V, temps):
-    """lookahead_chain's map (f_j = x_j ^ p_j f_(j-1) in place on U from U[0]): lookahead_tree with
-    the first block size in SWEEP_BLOCKS whose tree_temps fits len(temps), else lookahead_chain with
-    lookahead_sizes. Larger blocks need fewer temps and are slower."""
+def lookahead_sweep(C, U, V, temps, spec=None):
+    """lookahead_chain's map (f_j = x_j ^ p_j f_(j-1) in place on U from U[0]): carry_trees' blocks
+    for spec, or for SWEEP_GEO's spec at this length; else lookahead_tree with the first block size
+    in SWEEP_BLOCKS whose tree_temps fits len(temps), else lookahead_chain with lookahead_sizes.
+    Larger blocks need fewer temps and are slower."""
     n = len(U)
+    spec = spec or _geo_spec(n)
+    if spec:
+        lookahead_geo(C, U, V, temps, spec)
+        return
     for r in SWEEP_BLOCKS:
         if tree_temps(n, r) <= len(temps):
             lookahead_tree(C, U, V, temps, r)
@@ -273,7 +455,7 @@ def lookahead_sweep(C, U, V, temps):
     lookahead_chain(C, U, V, temps, lookahead_sizes(n - 1))
 
 
-def add_lookahead(C, a, b, cout, temps, tree=False, cin=None):
+def add_lookahead(C, a, b, cout, temps, tree=False, cin=None, spec=None):
     """b += a mod 2^w and cout ^= the carry out (none if cout is None), as add, with both sweeps in
     lookahead form. A wire holding 1 as cin adds 1, as in add; the sweeps restore it.
     The up-sweep leaves add's state after its last _maj (b_i = p_i, the carry wire c_0 ^ a_0,
@@ -293,7 +475,7 @@ def add_lookahead(C, a, b, cout, temps, tree=False, cin=None):
     up.cx(a[0], cin)
     if tree:
         adjacent_xor(up, a)
-        lookahead_sweep(up, [cin] + list(a), [None] + list(b), temps)
+        lookahead_sweep(up, [cin] + list(a), [None] + list(b), temps, spec)
     else:
         for i in range(w - 1):
             up.cx(a[i + 1], a[i])
