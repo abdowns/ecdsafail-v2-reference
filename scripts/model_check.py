@@ -70,11 +70,12 @@ def b1_swept(cells):
     return list(reversed(out))
 
 
-def _lazy_pending(m, plan, states, cells):
+def _lazy_pending(m, plan, states, cells, crossing=None):
     """Per lazy tick, the pending borrow p as the tick finds it, after the raw bit took it, and as the
     tick leaves it. V's physical word is the model's plus p at cut = kappa + LAZY_WINDOW. A bit that
     comes to the window's top takes p and clears it if the bit was 1; a subtract's borrow e that finds
-    the window 0 sets p when U or V has a 1 from cut up, and is the swap otherwise."""
+    the window 0 sets p when U or V has a 1 from cut up, and is the swap otherwise. With crossing, a
+    dict, it takes per lazy tick the bit of physical V at cut as the tick's second strip would find it."""
     R = m.LAZY_WINDOW
     out, p, V = {}, 0, None
     for t, key in enumerate(plan):
@@ -94,6 +95,8 @@ def _lazy_pending(m, plan, states, cells):
             p &= 1 - r
         mid = p
         z, hi = U >> k != 0, V >> k
+        if crossing is not None:
+            crossing[t] = hi >> R & 1
         if not add and bit:
             hi >>= 1
             r = hi >> (R - 1) & 1
@@ -110,14 +113,17 @@ def _lazy_pending(m, plan, states, cells):
 
 
 def _junk_value(m, q, x):
-    """The pass's junk register: E as the last tick found it, then per tick its chain's lowest carries
-    c_2 .. c_(carry+1) of U + NOT(V') on its width, V' being V ^ E at bit 0 with a no-subtract
-    tick's second strip already done on V[1:]; then the flag wire the tick makes, and the wire its
+    """The pass's junk register: E as the last tick found it, then per tick its chain's junk wires for
+    U + NOT(V') on its width, V' being V ^ E at bit 0 with a no-subtract tick's second strip already
+    done on V[1:]: the carries c_2 .. of the single bits, then one wire for each pair of bits (DESIGN.md,
+    "Two chain bits on one junk wire"); then the flag wire the tick makes, and the wire its
     flag update leaves; then a lazy tick's wires; then add AND E, the offset a subtract retires. The
     flag before a tick is [U >= 2^kappa]. A wire that carries it holds the flag of the tick that last
-    wrote it. The first lazy tick brings V's extra wire and the counter, which end 0, and the wire for
-    p. A raw tick moves p to a new wire, the old one keeping p as the tick found it, a tick of a lag
-    block leaves two AND NOT flag, and every lazy tick leaves two AND p."""
+    wrote it. The first lazy tick brings the wire for p and the counter wires the run leaves as junk;
+    V's extra wire and the rest of the counter end 0 and are borrowed. A raw tick moves p to a new wire, the old one keeping p as the tick found it, a tick of a lag
+    block leaves two AND NOT flag unless it kept its threshold, where _lag_clear clears that wire, and
+    every lazy tick leaves two AND p, or with STRIP_BIT_JUNK two AND r, r the bit of physical V at cut
+    that the second strip brings to the window's top."""
     states = tick_pass(q, x, m.iters)[0]
     cells = tick_tape(q, x, m.iters)[2]
     plan = m._tick_plan()
@@ -125,7 +131,8 @@ def _junk_value(m, q, x):
              for t, key in enumerate(plan)]
     bits = [states[m.iters - 1][2]]
     holder = p_wire = count_wire = None
-    pending = _lazy_pending(m, plan, states, cells)
+    pending_bit = {}
+    pending = _lazy_pending(m, plan, states, cells, pending_bit)
     counter = m._lazy_width(plan)
     for t, (key, (U, V, E), (add, bit)) in enumerate(zip(plan, states, cells)):
         if key is None or key[3]:
@@ -140,10 +147,17 @@ def _junk_value(m, q, x):
                 vv = sum(b << i for i, b in enumerate(vb))
             nb = ~vv & ((1 << w) - 1)
             c = nb & 1
-            for i in range(1, carry + 1):
+            singles, pairs = m._junk_split(carry, m._carry_junk(w, top_clear, narrow, kappa if high else None))
+            for i in range(1, singles + 1):
                 a, b = U >> i & 1, nb >> i & 1
                 c = a & b | a & c | b & c
                 bits.append(c)
+            for i in range(singles + 1, singles + 2 * pairs, 2):
+                # A pair's wire: b_0 ^ a_0 ^ a_1 ^ g1 ^ g0 * (a_0 ^ c_0 ^ a_1 ^ c_1), g1 the swap.
+                a0, b0, a1, b1 = U >> i & 1, nb >> i & 1, U >> (i + 1) & 1, nb >> (i + 1) & 1
+                c1 = a0 & b0 | a0 & c | b0 & c
+                bits.append(b0 ^ a0 ^ a1 ^ (add & bit) ^ (add & (a0 ^ c ^ a1 ^ c1)))
+                c = a1 & b1 | a1 & c1 | b1 & c1
         if init:
             holder = len(bits)
             bits.append(flags[t])
@@ -156,24 +170,26 @@ def _junk_value(m, q, x):
         if key[9]:
             found, mid, left = pending[t]
             if key[9][1] == 0:
-                p_wire = len(bits) + 1
+                p_wire = len(bits)
                 count_wire = p_wire + 1
-                bits.extend([0] * (2 + counter))
+                kept = m._lazy_kept(plan)
+                bits.extend([0] * (1 + kept))
             if key[9][3] and key[0] - key[5] > m.LAZY_WINDOW + 1:
                 # A run that ends at a longer word leaves the counter as it stands: rho = pi - 1 on
                 # m_out bits, pi the ones of U and of V's physical word from cut up.
                 cut, Un, Yn = key[5] + m.LAZY_WINDOW, states[t + 1][0], states[t + 1][1]
                 rho = bin(Un >> cut).count("1") + bin((Yn + (left << (cut - 1))) >> (cut - 1)).count("1") - 1
                 rho &= (1 << key[9][2]) - 1
-                for i in range(counter):
+                assert kept == key[9][2]
+                for i in range(kept):
                     bits[count_wire + i] = rho >> i & 1
             if key[9][0]:
                 bits[p_wire] = found
                 p_wire = len(bits)
                 bits.append(0)
-            if key[10]:
+            if key[10] and not (m.LAG_CLEAR and fmode == "same"):
                 bits.append((1 - add) & bit & (1 - flags[t]))
-            bits.append((1 - add) & bit & mid)
+            bits.append((1 - add) & bit & (pending_bit[t] if m.STRIP_BIT_JUNK else mid))
             bits[p_wire] = left
         bits.append(add & E)
     return sum(b << k for k, b in enumerate(bits))

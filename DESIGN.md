@@ -566,3 +566,333 @@ Writing the offset onto a fresh wire each tick instead of retiring it gives the 
 `scripts/sweep_check.py` (accept's `I2.sweep`) checks both sections at gate level on ten primes from 7 to 4,093, with and without a rank-one start, over every x: the unswept pass against `tick_tape`, both sweeps against a model that shares no code with the circuit, the swap wires before and after, and M and its inverse.
 Four mutants must each fail it: `_sweep_in` without its CCX, without its last CX, the mark restore without its X, and no unsweep.
 `DialogMultiplier.INLINE_SWEEP = False` and `SWAP_WIRES = False` restore the previous constructions.
+## Square leaves write row 0 without an adder
+
+Ported from 2elliot's square branch (6b1f34d, on Mike's lowt-depth). In `_rows`, after row 0's Gray step Y[j] holds y_j XOR y_0 for j >= 1, and row 0 adds those bits onto Q[1:].
+
+- Uncopied (T leaves), Q is still 0 there, so the add is a copy: Q[1:n] ^= Y[1:n], and there's no carry.
+- Copied (R leaves), Q holds Y, and Y + 2*(row 0) is 2Y when y_0 = 0 and 2^w - 1 when y_0 = 1. So Q[0] = Q[1] = y_0, Q[k] = y_0 OR y_(k-1) for 1 < k < w, and Q[w] = NOT y_0 AND y_(k-1). Each NOT y_0 AND y_(k-1) equals NOT y_0 AND (y_(k-1) XOR y_0), which is one CCX from the Gray wire under X(y_0), and the ORs follow by CX from y_0. Bits at len(Q) and above are dropped, as the adder's would be mod 2^len(Q).
+- So row 0 costs w - 1 CCX copied and 0 uncopied, in place of an adder of w - 1 bits. A leaf of width 1 is a copy or nothing.
+
+Check: `scripts/rows_check.py . 11` builds `_rows` for every leaf width 1 to 11, every output length 1 to 2w, copied and uncopied, with and without a kept-carry list. On every Y it checks Q = Y(2^w - Y) or Y(2^w - 1 - Y) mod 2^len(Q) and that Y comes back: 528 configurations, 0 failing. Without kept carries, its outputs equal 0f5514b's bit for bit on every input.
+
+At G: 2,961,008 -> 2,958,220 CCX (-2,788), at 4,096 wires.
+
+## The second fold's loaded constant as a constant add
+
+With 3a absorbed, the second fold starts from T = klo, loaded by X gates, and its first digit added E onto it with the ripple adder: 2 CCX a bit from bit 0, whatever klo's bits are.
+Now `_multiple(..., load=True)` takes T clean, copies E onto it and adds klo with `add_const`: T = E + klo either way, and E + klo ≤ f + kE + klo < 2^top for top = bitlen(f + kE + klo), so the add on T[:top] carries nothing out and the wires above stay 0, as the bound the adder used already said.
+`add_const`'s chain reads the constant, so the 0 bits below klo's lowest 1 cost nothing. At G klo has two of them, which is 4 CCX each way.
+The later digits see the same T, and the chain's wires come from the ladder's lent wires, so the peak stays where it was.
+`load` is only set when klo is nonzero; a fold with no absorbed constant still copies.
+
+`scripts/fold_check.py` builds `compute` with every absorbed constant c at every fold prime of 4 to 8 bits, and 97 of them at 9 to 11 bits, runs every Y, and checks J[:n] = (Y² - c) mod q, Y unchanged, and every junk wire 0 after the reverse; it counts the builds that load a constant. At secp256k1 it samples Y, with the edges, for c = 3a and two random c.
+Its controls make the constant's add one bit short, and drop the constant's lowest set bit; each fails thousands of lanes.
+A BDD run of the second fold alone over every E ≤ f + kE at G (33 inputs) finds no CCX left there that never fires or has equal or constant controls; before this change it found exactly the four that the trailing 0 bits of klo account for.
+
+At G: 2,958,220 -> 2,958,212 CCX (-8), 4,096 wires.
+
+## S = A + B out of place
+
+A Karatsuba node copied A onto S's clean wires and rippled B onto the copy, 2h - 1 CCX for halves of h bits, because an in-place adder builds each carry and takes it down again.
+S is clean, so no carry needs taking down. `_sum` walks up from bit 0: while S[i] still holds the carry into bit i, it writes the carry into bit i + 1, MAJ(a_i, b_i, c_i) = c_i ⊕ (a_i ⊕ c_i)(b_i ⊕ c_i), onto S[i+1] with one CCX, and then S[i] takes a_i and b_i by CX and holds the sum bit.
+Above B's top the carry is a_i ∧ c_i, still one CCX. That is h CCX, A and B are as they were, and S holds A + B on the same wires as before, so nothing after it changes; the pad wire the ripple took for an odd width is gone and the peak is where it was.
+
+`scripts/sum_check.py` runs every (A, B) for h = 1 to 8 with B of h and of h - 1 bits, and every CCX dropped or turned into a CX from either control fails: 213 mutants, none unnoticed.
+`scripts/fold_check.py` runs the whole fold on every Y at the small fold primes, where leaves of 3 wires put nodes at every level.
+
+At G the 13 nodes save h - 1 each, both ways: 2,958,212 -> 2,957,012 CCX (-1,200), 4,096 wires.
+
+The same holds for any sum written onto clean wires: a copy and an in-place add cost two CCX a bit, an out-of-place sum one.
+
+## Rows 0 and 1 of an uncopied leaf as one out-of-place sum
+
+An uncopied leaf copied row 0 onto its clean Q and then rippled row 1 onto it in place: 2w - 5 CCX for a leaf of w wires, or w - 2 with w - 3 kept-carry wires.
+Q is clean when both rows arrive, so Q = 2 r_0 + 8 r_1 is an out-of-place sum, like S above: places 1 and 2 take r_0's bits alone, and from place 3 up the carry into place p + 1 is written onto Q[p+1] while Q[p] still holds the carry into p, then Q[p] takes its two bits. Place w has r_1's top bit and the carry only, and the carry out lands on Q[w+1].
+That is w - 2 CCX and no kept wire.
+
+Both rows' bits must be on wires at once. After the Gray steps of rows 0 and 1, Y[j] holds r_1's bit y_j ⊕ y_1 for j ≥ 2 and Y[1] holds y_1 ⊕ y_0, which is r_0's bit 1. r_0's bit j is y_j ⊕ y_0 = Y[j] ⊕ Y[1], so a CX from Y[1] puts it on Y[j] for the one step that reads it and a second CX takes it off; the step's other operand is Y[p-1], a different wire.
+Writes at or above len(Q) are dropped, as the adder's were mod 2^len(Q). Q after the two rows is the number it was, so rows 2 on, their bounds and their kept carries are unchanged; KEEP's wires that row 1 used go to later rows at the same 1 CCX each way.
+Leaves of fewer than 3 wires and copied leaves are as they were: a copied leaf's row 0 is not linear in Y, so it cannot be an operand of such a sum.
+
+`scripts/rows_check.py . 11` checks `_rows` against Y (2^w - 1 - Y) mod 2^len(Q) on every Y for every width to 11, every output length, with and without kept wires, and now ends with controls: each of the 120 single-CCX mutants of the uncopied leaves of 3 to 7 wires breaks the contract.
+`scripts/fold_check.py` and the toy curves run the leaves inside the fold on every input.
+
+At G: 2,957,012 -> 2,955,952 CCX (-1,060), 4,096 wires.
+
+## Fold digits onto a target that is 0 from some bit up
+
+`_multiple` bounds the accumulator before each digit. Where that value is at least 0 and the digit adds, the target is 0 from bit z = bitlen(the largest bound) up, and the digit's ripple ran over those wires at 2 CCX a bit all the same.
+Now the digit ripples in place below z only, with its carry out on target[z], which is clean. From z up the sum is out of place: the carry into bit p + 1 is a_p ∧ c_p, written onto the clean target[p+1] while target[p] holds c_p, and then target[p] takes a_p. That is one CCX a bit, and the last carry is dropped where the old bound already said the sum fits.
+Past the digit's top wire the carry just stays where it landed. Digits that subtract, or that meet a value that may be negative, are as they were.
+The first fold's low digit also takes this path with z at the digit's own top: its carry out lands on E[0] as a carry out, not through a padded ripple bit.
+
+At G the first fold's digits at 2^0, 2^4 and 2^32 have 1, 4 and 23 such bits and the second fold's at 2^4 and 2^32 have 3 and 22.
+`scripts/fold_check.py` has a third control: taking the target as clean one bit below the bound fails 5,966 lanes.
+
+At G: 2,955,952 -> 2,955,844 CCX (-108), 4,096 wires.
+
+## Two chain bits on one junk wire
+
+A junk wire of the Euclid chain now takes two bits at 6 CCX, where it took one at 3 and the bit beside it ran in place at 4.
+So each carry-junk wire saves 2 CCX a pass instead of 1, and a junk wire in M is worth 8 CCX instead of 4.
+Nothing here depends on q; the cell is exact on every input of its domain, which is the single cells' domain: the junk wire 0 on entry, and g1 implies g0 on the way down.
+
+**The cell.** `_pair_up` and `_pair_down` in `qec/point_add.py`, on wires A_0, B_0 (the lower bit's U and V), A_1, B_1 (the upper bit's), Cw (the carry into the lower bit, which the cell only reads) and J (the junk wire).
+Write a_i, b_i for the bits (b is NOT vhat, as everywhere in the chain), c for the carry in, e_0 = a_0 ^ c, f_0 = b_0 ^ c, x_i = a_i ^ b_i, c_1 = MAJ(a_0, b_0, c) = c ^ e_0 f_0 and c_2 = MAJ(a_1, b_1, c_1).
+
+**P1: the way up, 2 CCX.**
+J takes p = e_0 (f_0 ^ x_1), then a_0, so J = k with k = a_0 ^ p = c ^ e_0 ^ e_0 f_0 ^ e_0 x_1 = c_1 ^ e_0 (1 ^ x_1).
+So k is c_1 unless e_0 = 1 and a_1 = b_1, and MAJ(a_1, b_1, .) does not read its third input when a_1 = b_1.
+A_1 and B_1 take k, and J ^= A_1 B_1 gives k ^ (a_1 ^ k)(b_1 ^ k) = MAJ(a_1, b_1, k) = c_2.
+The lower bit's wires and Cw are as found, J holds the carry out for the bits above, and c_1 is on no wire.
+
+**P2: the way down, 4 CCX.** Write P = g0 e_0.
+- A_1 and B_1 take b_0; then B_0 ^= g0 e_0 ^ e_0, so B_0 = b_0 ^ e_0 ^ P.
+- W = A_1 ^ B_0 ^ e_0 = a_1 ^ k ^ P = (a_1 ^ c_1) ^ e_0 (1 ^ x_1 ^ g0), and (x_1 ^ g0) W = (x_1 ^ g0)(a_1 ^ c_1), because y (1 ^ y) = 0 for y = x_1 ^ g0.
+  J ^= (x_1 ^ g0) W turns c_2 = a_1 ^ x_1 (a_1 ^ c_1) into a_1 ^ g0 (a_1 ^ c_1), and J ^= x_1 makes it b_1 ^ g0 (a_1 ^ c_1), the upper bit's B output.
+  This one product is the upper bit's unwind and its g0 select together.
+- B_0 ^= e_0 leaves b_0 ^ g0 e_0, the lower bit's B output, written V_0 below.
+- B_1 takes G = x_1 ^ V_0 ^ a_0 ^ g1, and A_1 ^= (e_0 ^ g1) G.
+  With e_0 P = P and g1 P = g1 e_0 (g1 implies g0), (e_0 ^ g1) G = e_0 x_1 ^ e_0 x_0 ^ P ^ g1 x_1 ^ g1 x_0 ^ g1, and p ^ e_0 x_1 ^ e_0 x_0 = e_0.
+  After the CX from B_0, Cw, A_0 (twice, around the next step) and g1, A_1 = a_1 ^ k ^ b_0 ^ (e_0 ^ g1) G ^ V_0 ^ c ^ g1 x_0 = a_1 ^ g1 (x_1 ^ 1), the upper bit's A output.
+- A_0 ^= g1 (V_0 ^ c ^ 1): on g1, V_0 ^ c = b_0 ^ e_0 ^ c = x_0, so A_0 = a_0 ^ g1 (x_0 ^ 1), the lower bit's A output.
+- Two CX leave B_1 = b_1 ^ g0 (a_1 ^ c_1) and J = B_1 ^ G, a function of the step's input, which the inverse pass, the same gates reversed, clears like any other junk.
+
+So the four outputs are those of `_shared_difference`'s single cells, Cw, g0 and g1 are untouched, and the cell is 6 CCX.
+
+**Layout and plan.** `_junk_split` gives a tick's m junk wires to its chain's bits from 1 up: singles first, then pairs, each pair's wire being the carry wire of the bit above it.
+`_tick_plan` gives wires to pairs first, from the last tick back, and only then to the bit a tick of odd length has left; at n = 256 all 1,161 wires hold pairs, 2,322 bits.
+`CARRY_JUNK` stays 1161: the pass's junk width and M's peak do not move. `JUNK_PAIRS = False` restores one bit a wire.
+
+**How it was found, and what the search closes.**
+`cell.c` and its variants (in the work directory, not the tree) search every circuit of a given CCX count on a cell's wires, with CX and X free: the state is the affine span of the wire functions on the cell's domain, and a CCX replaces one direction t by t ^ xy for x, y in a hyperplane that misses t.
+It finds the single cells' known costs (in place 4, junk 3) and proves, for two bits: in place there is no 7-CCX cell with 2 or 3 CCX before g1 is known (S2's 2+5 and 3+4 splits), also with one clean wire borrowed and returned for 2+5; with one junk wire 6 CCX exists and 5 does not with two.
+A plain adder gets nothing from the same idea: two bits on one junk wire cost 3, not 2.
+
+At G: 2,961,008 -> 2,956,364 CCX (-4,644), T 20,727,056 -> 20,694,548, 4,096 wires.
+
+**Checks.** `scripts/pair_check.py`: the cell on all 96 inputs (c_2 at the top, the four outputs, Cw, g0 and g1 restored, the reversed halves restoring the input); 61 mutants, each gate dropped and each CCX turned into a CX from either control, all caught; then M and its inverse as gates on every x at every odd prime from 11 to 257 and every junk budget from 0 to the full plan, 919 builds with 0 bad lanes, 868 with a pair, 133 with a single beside pairs, 764 with a pair under an in-place bit; `JUNK_PAIRS = False` agrees; dropping `_pair_down`'s last CCX gives 162 bad lanes.
+`scripts/model_check.py`'s junk model now computes a pair's wire, b_0 ^ a_0 ^ a_1 ^ g1 ^ g0 (a_0 ^ c_0 ^ a_1 ^ c_1), independently of the gates, and its pass rows match it on every x at its primes and on the secp256k1 rows.
+`schedule_check.py` and the full `accept.py` pass: 13 pass, 0 fail, 1 pending.
+
+### The lazy run and the lag blocks at the new junk price
+
+A lazy or lag tick leaves junk wires, and each is now a carry-junk wire's 2 CCX a pass forgone, not 1.
+Re-run at a fixed junk width of 2,718, `LAZY_END` = 11 (from 9) and `LAG_BLOCK` = (15, 7, 5, 3) (from (15, 7, 3)) give the least pass: 272,459 CCX against 272,481, with `CARRY_JUNK` = 1169 filling the 4,096 wires.
+Other ends (None, 5, 7, 8, 10, 12, 13, 16, 24), `HIGH_MIN` 2, 4 and 5, other length sets (with 2, 4, 6, 9, 11, 13, 31) and shorter `LAG_SPAN`s are no better; a junk term in the lag planner's own cost does not help either.
+Both knobs only choose among plans the tree already builds: `schedule_check.py` now runs its forced-length rows at 5 as well, and it, `model_check.py` and the full `accept.py` pass on the new plan.
+At G: 2,956,364 -> 2,956,276 CCX (-88), 4,096 wires.
+
+### Counted strips cleared where the threshold stays
+
+A lag tick used to leave its counted strip x = two AND NOT flag as junk for the block's realign and the inverse pass.
+On a tick that keeps its threshold (fmode same) the wire is now a clean one borrowed to the block's end, where `_lag_clear` clears it with one CCX after the realign; the tick itself and the realign are unchanged.
+
+After such a tick the cell's b holds two ^ g1, and g1 implies g0.
+The flag update left zg = g0 * flag on its junk wire and flag ^ zg = flag AND NOT g0 on the flag's, so NOT g0 AND NOT flag = 1 ^ g0 ^ flag ^ zg = 1 ^ g0 ^ (the flag the tick left).
+The flag a tick left is linear in what the block's end still holds: the XOR of the g0 * flag wires of the same ticks after it up to the next drop tick's kept flag, or the live flag, exactly the chain `_lag_tally` already reads.
+So b AND NOT (g0 ^ flag left) = (two ^ g1) AND NOT g0 AND NOT flag = two AND NOT flag = x, since g1 AND NOT g0 = 0 and two implies NOT g0, and one CCX on a clean wire that takes g0 ^ flag left clears x.
+Nothing between the tick and the block's end writes the cell, the flag wires or the strip.
+On a tick whose threshold drops, g0 * flag is not kept, the same clear would take 2 CCX, and the wire is worth 2 a pass, so those strips stay junk.
+
+At n = 256 this frees 106 junk wires at +106 CCX a pass; `CARRY_JUNK` goes from 1169 to 1275 and the 106 wires take 212 more chain bits as pairs. `LAG_CLEAR = False` restores the junk strips.
+At G: 2,951,112 -> 2,950,688 CCX (-424), 4,096 wires; the Euclid pass borrows at most 15 more clean wires at a time (4,004 against M's 4,093).
+
+**Checks.** `scripts/lag_check.py` runs M and its inverse as gates with forced block lengths, where toy plans have lag ticks that keep their threshold: every x at q = 4093, 8191 and 65521 (blocks of 1 and 2), and powers of two, values near q and q/k and 3,000 random x at 22, 28, 40 and 61 bits (blocks of 3, 5 and 7): 24 cleared strips, 52,958 inputs with a strip set at one of them, 0 bad lanes, and the same with `LAG_CLEAR` off.
+Its controls, the clearing CCX dropped and the flag left out of it, give bad lanes in all 8 builds; at secp256k1 with the plan as built, 500 inputs give 0 bad lanes and the dropped-CCX control fails.
+`model_check.py`'s junk model drops the strip of those ticks; it, `schedule_check.py`, `pair_check.py` and the full `accept.py` pass.
+
+### The lazy run's clean wires are borrowed, not junk
+
+The first lazy tick used to bring V's extra wire, the pending borrow's wire and the whole counter as junk wires.
+V's extra wire is 0 again when the run ends (the last tick clears it), and so is every counter wire above the last tick's width m_out: the counter is sign-extended, and each tick whose width shrinks clears the copies it drops.
+Where the run ends at LAZY_WINDOW + 1 bits the last tick clears the whole counter.
+So the pass now takes V's extra wire and the counter's wires above `_lazy_kept` from the allocator at the first lazy tick and frees them after the last; only p's wire and the `_lazy_kept` counter wires that still hold rho stay in the junk register.
+No gate changes: the same wires are 0 at the same point, they just stop being held through the Bezout pass.
+
+At n = 256 the counter is 8 wide and ends 5 wide, so 4 wires leave the junk register and `CARRY_JUNK` goes from 1275 to 1279.
+At G: 2,950,688 -> 2,950,656 CCX (-32), 4,096 wires.
+
+**Checks.** `model_check.py`'s junk model no longer lists those wires, and its gate rows require every wire outside the registers to end 0, which covers a borrowed wire given back dirty.
+`scripts/lag_check.py` adds rows for the run: every x at q = 1021, 4093 and 8191 with `LAZY_END` None, 4 and 5, and sampled x at 20 and 32 bits where the run keeps fewer counter wires than the counter has: 11 builds, 0 bad lanes; keeping one counter wire fewer than `_lazy_kept` says, the control, fails in all 4 builds that keep any.
+`schedule_check.py` and the full `accept.py` pass.
+
+### The high word's top borrow goes straight to its target
+
+`_high_word` ran its borrow ladder E_0 .. E_R on scratch, copied the top borrow E_R out, and unwound the whole ladder, so E_R cost two CCX and a third in the lazy window, where E_R s goes to g1 and the rest of E_R to p.
+With `TOP_BORROW_DIRECT` the ladder's last CCX writes E_R onto the wire that wants it, and that step is not unwound.
+
+A whole high word (not a lazy window) wants g1 ^= E_R: the last CCX targets g1. Nothing reads g1 between that CCX and the old CX, so the map is the same, one CCX less.
+
+A lazy window wants g1 ^= E_R s and p ^= E_R AND NOT s, with s the sign of rho (no 1 from cut up in U or in physical V) and p the pending borrow.
+The last CCX now targets p, which then holds p ^ E_R, and g1 takes (p ^ E_R) s with one CCX; the two CX that follow are the old ones and leave p ^ E_R ^ E_R s on p.
+(p ^ E_R) s = E_R s because p s = 0 whenever a tick reaches its high word: by then the raw bit and the second strip have met p, so physical V is the true V plus p 2^cut, the invariant `schedule_check.py` follows (`phys - (p << cut) == V`). The true V is not negative, so a set p puts physical V at 2^cut or more, which is a 1 from cut up, rho >= 0 and s = 0.
+If p s were 1 at some tick, g1 would be flipped there, so M as gates is the test of this.
+That is one CCX less a lazy tick, and one less a whole high word.
+
+At G: 24 whole high words and 349 lazy ticks a pass, 373 CCX a pass: 2,950,656 -> 2,949,164 CCX (-1,492), 4,096 wires; `CARRY_JUNK` stays 1279. `TOP_BORROW_DIRECT = False` restores the old gates.
+
+**Checks.** `scripts/window_check.py` runs M and its inverse as gates with `TOP_BORROW_DIRECT` on and off, every x at q = 1021, 4093, 4099, 8209, 16411, 32771, 65537 and 65539 and sampled x at 20, 32 and 61 bits, with `LAZY_END` varied so that whole high words appear: 16 builds, 0 bad lanes either way.
+A pending borrow is rare: no x sets p at the primes just under a power of two (the toy primes of the other checks, and none of 6,861 inputs at secp256k1 did in the junk model), but at a prime just above one hundreds do. At the six such primes here 2,268 inputs set p and 424 reach a later high word with it set, counted from `model_check.py`'s arithmetic model of p.
+Controls: the lazy ladder's last CCX dropped fails in 16 of 16 builds, g1 taking p ^ E_R without s in the 10 of 10 where p is set, and a whole word's last CCX dropped in 7 of 7; at secp256k1 with the plan as built, 519 inputs give 0 bad lanes and the first control 456.
+`lag_check.py`, `schedule_check.py`, `model_check.py` and the full `accept.py` pass.
+
+### The lazy window as one cell of 6 CCX
+
+A lazy tick's high word is always the same small map: the two window bits of U and V, the carry in cw, g0, z and zg, g1, and the lazy s and p. As a ladder it took 8 CCX (9 before the top borrow went straight onto p).
+With `LAZY_CELL` it is a fixed gate list, `_LAZY_CELL`, with 6 CCX and no scratch wire, found by an exhaustive search over circuits on the window's domain. 6 is the floor for this map on this domain: its outputs need six products that are independent of each other and of the inputs.
+
+The cell equals the ladder on the domain, not everywhere, so the domain is the proof's content. At a lazy tick's high word:
+
+1. U's two window bits or V's are 0, z = 1 beside bits of U's and z = 0 beside bits of V's, zg = g0 z, g1 = 0. This is `_high_word`'s own contract: the tick's threshold kappa is the joint one, so U and V are not both at 2^kappa or more, and z is the flag [U >= 2^kappa]. With p = 0 the physical V is the true one.
+2. p s = 0 (the section above).
+3. A set p finds z = 0, U's window bits 0 and V's both 1. The carry cw and g0 are left free.
+
+For 3, follow a pending borrow from the subtract that set it, at threshold k0 and cut c0 = k0 + 2. The larger register was H 2^c0 + L with H >= 1, window 0 and L below the smaller one, m; the tick left U = m and the true V = ((H - 1) 2^c0 + 2^c0 - (m - L)) / 2.
+Claim: while p stays set, at each later lazy tick with threshold k and cut c = k + 2, once the tick's crossing bits have met p, physical V = P 2^c + 2^c - d - e with P >= 1, 1 <= d <= u, e the held offset bit, and u = m unchanged with u < 2^k / 9.
+It holds after the setting tick with P = H and d = (m - L) / 2. Each tick halves V once, or twice with a second strip, and the cut drops by one or stays. A strip halves d; a subtract has V > U, so it does not swap, and takes d to (d + u) / 2 <= u; d stays at least 1 because each halving is of an even number. A halving that the cut follows keeps P. One that it does not follow, at a tick that keeps its threshold or strips twice, brings P's low bit to p: a 1 clears p and ends the run, a 0 leaves P / 2 >= 1.
+The true V is at least 2^c - d - 1 >= 3 * 2^k, and the pass's potential bound max^2 min 4^t <= 2 q^2 x < 2^(3 k + 2 t) at a high tick gives u < 2^k / 9.
+So under p: U < 2^k, which is z = 0 and U's window bits 0; V's bits below c are 2^c - d - e > 2^c - 2^k, so its window bits are both 1; and P >= 1 is a 1 from cut up, s = 0 again.
+These are the lazy run's own invariants: `_lazy_plan` states them and `schedule_check.py`'s `lazy_states_ok` asserts them at every lazy tick of the recurrence (`z and (hi or p)`, `p and hi & mask != mask`).
+
+On that domain, 68 points, the cell and the ladder agree on every wire. Outside it they differ (26 of the 28 further points with p s = 0), so the domain is used.
+
+At G: 349 lazy ticks a pass, 2 CCX each: 2,949,164 -> 2,946,372 CCX (-2,792), 4,096 wires; `CARRY_JUNK` stays 1279. `LAZY_CELL = False` restores the ladder.
+
+**Checks.** `scripts/window_check.py`, in four parts.
+The cell against the ladder with both switches off, on all 68 points: 0 wrong; the cell has 6 CCX in 115 gates, none on a scratch wire, and dropping any one gate gives a wrong point.
+The domain as the gates see it: M with a marker in front of each lazy window, every x at q = 4099, 8209, 16411, 32771, 65537 and 65539, all 3,166,842 tuples the windows find on the forward pass: none outside the domain, 827 with p set.
+M and its inverse as gates on the same 16 builds as before, with the cell, with the direct ladder and with both off: 0 bad lanes. Controls: the cell without each one of its CCX fails wherever some x sets p (one of the six only acts where a borrow stays pending, and fails nowhere else), and the three ladder controls fail as before.
+secp256k1 with the plan as built, 519 inputs: 0 bad lanes, and the cell without its first CCX fails.
+`lag_check.py`, `schedule_check.py`, `model_check.py`, `pair_check.py` and the full `accept.py` pass.
+
+### A lazy tick's junk is the bit its second strip brought
+
+A lazy tick made spare = b r on a scratch wire, r = V[cut] the bit its second strip brings to the window's top, counted with it, and took it back after the strip against the bit's new place. Then it made t = b p on its junk wire, gave the bit t, and took t AND NOT (the new bit) off p. That is 4 CCX and a junk wire holding b p.
+With `STRIP_BIT_JUNK` the spare is made on the junk wire and never taken back. The bit takes b p with one CCX from b and p, and p loses (b r) AND NOT (the new bit) with one more: 3 CCX, and the junk wire holds b r.
+
+The map on V and p is the same. The bit takes b p either way. Off b nothing happens in either. On b the new bit is r ^ p, and p lost p AND NOT (r ^ p) = p r before; now it loses r AND NOT (r ^ p) = r p.
+The junk only has to make the meeting reversible, and the inverse pass, the same gates backwards, is its only reader: (r, p) -> (r ^ p, p AND NOT r) sends (0, 0) and (1, 1) to (0, 0), and r tells them apart as well as p does.
+The counting between is unchanged, the same wire values on another wire. No condition on the inputs is used.
+
+At G: one CCX less in each of the 349 lazy ticks of a pass: 2,946,372 -> 2,944,976 CCX (-1,396), 4,096 wires; `CARRY_JUNK` stays 1279. `STRIP_BIT_JUNK = False` restores the old gates.
+
+**Checks.** `model_check.py`'s junk model has b r on that wire (`_lazy_pending` hands it the bit) and its pass rows compare every junk wire; but no x sets b r at the primes it runs the pass on, so `scripts/window_check.py` runs the same comparison, the pass alone as gates against the model's U, tape and junk, on every x at q = 4099, 8209, 16411, 32771 and 65537: 0 bad bits, 137 inputs with b r set, and the model with b p on that wire fails at all five.
+Its M rows run with the switch on and off, 0 bad lanes, and two more controls, the CCX onto the bit dropped and the CCX onto p dropped, fail on all 8 builds where some x strips twice under a pending p (129 inputs; they only act there).
+`lag_check.py`, `schedule_check.py`, `pair_check.py` and the full `accept.py` pass.
+
+### The lazy counter's step: last carry straight onto the top bit, two bits by a majority
+
+`_count` adds a bit to the lazy counter through a ladder of carries on scratch, a_(i+1) = a_i reg_i, XORs each carry into its bit from the top down and takes each one back: 2 (n - 1) CCX on n bits.
+With `COUNT_SHORT` the last carry, the one into the top bit, is written onto that bit by the CCX that would have made it: reg_(n-1) ^= a_(n-2) reg_(n-2). Nothing else reads that carry, the CCX's controls are not its target, and the rest of the ladder is as before, so the map is the same in 2 n - 3 CCX.
+
+A raw tick steps the counter down by two bits at once, the bit at cut - 1 and the spare b r. It made both = bit AND spare on scratch (one CCX), counted with ctl = bit ^ spare and both XORed into the carry out of bit 0, and took both back (one more).
+That carry, ctl reg_0 ^ both, is the majority of bit, spare and reg_0. `_count` now takes the second bit as `also` and makes the carry as bit ^ (bit ^ spare)(bit ^ reg_0), one CCX between CX pairs that restore spare and reg_0; bit 0 then takes bit ^ spare as before. The same carry, without the wire for both and its two CCX.
+
+At G: 349 counter steps a pass lose one CCX and the 116 raw ones two more: 2,944,976 -> 2,942,652 CCX (-2,324), 4,096 wires; `CARRY_JUNK` stays 1279. `COUNT_SHORT = False` restores the old gates.
+
+**Checks.** `scripts/window_check.py` runs `_count` alone as gates on 1 to 8 bits, up and down, with one bit and with two: all 6,104 pairs of a register value and a step give the sum with the step bits kept and the scratch clean, each counter has 2 n - 3 CCX, and up to 6 bits no gate can be dropped without a wrong case.
+Its M rows run every build with the switch on and off: 0 bad lanes. `lag_check.py`, whose lazy-run rows end the run with the counter in every state, `schedule_check.py`, `model_check.py`, `pair_check.py` and the full `accept.py` pass.
+
+### The lazy run's end at the lazy tick's new cost
+
+A lazy tick is now 6 CCX cheaper than when `LAZY_END` was set (the window cell, the strip's junk bit, the counter step), and a whole high word only 1. Re-run at the fixed junk width of 2,718, the pass is least with the run ending at 8 bits: 270,317 CCX against 270,344 at 11 (270,318 at 7, 270,322 at 9); the lag blocks (15, 7, 5, 3) stay the best of the sets tried.
+Ending earlier leaves 11 fewer junk wires to the run's ticks, so `CARRY_JUNK` goes from 1279 to 1268 to keep 4,096 wires. No gate is new: the plan's lazy run is 9 ticks longer and 9 whole high words become lazy ticks.
+
+At G: 2,942,652 -> 2,942,544 CCX (-108), 4,096 wires.
+
+**Checks.** `schedule_check.py` checks the plan's lazy fields and states for every `LAZY_END` it is given and for the built plan; `lag_check.py`, `model_check.py`, `pair_check.py` and the full `accept.py` pass.
+`scripts/window_check.py` runs as before and gains a secp256k1 part that does exercise the pending borrow there: none of the sampled or hard inputs sets p at secp256k1, but x = q - 2^j - r with a small r often does. The run draws such x from a seed and keeps the 48 that the model says set p (17 reach a later high word with it set, 10 strip twice under it): 0 bad lanes for M and its inverse on them and on the 519 sampled inputs, and on those 48 all ten controls fail (the cell without each of its six CCX, the two strip controls, and the ladder's no write and no s).
+
+## One carry chain for a compare and its conditional subtract (rank_one.sub_if_ge)
+
+The rank-one start reduces by U in four places with the same pair: `greater` makes flag = [b ≥ a], 2 CCX a bit, and `sub` under the flag takes a off b, 3 CCX a bit. Both ripple the same carries, those of a + ~b.
+`sub_if_ge(C, a, b, flag, ctl)` ripples them once. The majority sweep of a controlled adder does not read its control, so it runs first on a + ~b; its top carry is [a > b], which a CX and an X (or a CCX and a CX under ctl) turn into the flag; and the sweep back down, `_cuma` under the flag, restores a and writes ~b + flag·a, which the X gates around make b - flag·a.
+That is 3 CCX a bit and the same wires: one carry-in wire and a's zero extension.
+
+It replaces the pair in `_mod_double` (both forms), in `_mod_add`, and in `residue`'s quotient loop; nothing else in those functions changes, and no other function of rank_one.py is touched.
+
+`scripts/subge_check.py` builds the helper and the old pair for len(b) = 1 to 7, len(a) = len(b) and len(b) - 1, with and without ctl, and runs every (a, b, ctl): both leave flag = ctl·[b ≥ a], b - flag·a, a and ctl as found and every other wire 0. Each of the helper's CCX dropped, or turned into a CX from either control, fails: 549 mutants, none unnoticed.
+
+At G: 2,942,652 -> 2,939,472 CCX (-3,180), 4,096 wires; the Bézout pass goes from 888,721 to 887,131.
+`scripts/m_check.py` runs the multiplier itself, M(x, y) = (x, x·y mod q) with every other wire 0, where the rank-one start is on: every (x, y) at q = 61 (J = 3) and 251 (J = 4), and 40,000 sampled pairs with the edges at 4093 (J = 9) and 8191 (J = 12); a flipped bit after each `sub_if_ge` fails 12,750 lanes.
+
+## The last row of the convert's clearing product as a copy (rank_one.mul_acc)
+
+`convert` ends by clearing D: D·q - U·s + V·r is 0 mod 2^(w+1), as three products added onto D, each row a controlled add at 3 CCX a bit.
+The adds commute, so the subtraction of U·s now comes last, and inside it row 0 comes last. D is 0 after that row, which is the tree's own claim when it frees D, so before it D holds U_0·s: the row is a controlled copy off D, `ccx(U_0, s_i, D_i)`, one CCX a bit. This is the out-of-place rule run backwards: a sum that ends on clean wires needs no carries either.
+`mul_acc(..., sign=-1, clears=True)` does this; without `clears` it is as it was. On every input where the old order left D at 0, the new one leaves the same wires, since each differs from the old only by that last row's form.
+
+`scripts/mulacc_check.py` runs every (a, b) for 1 to 5 wires with acc = a·b: acc ends 0, a and b as found, and all 165 single-CCX mutants fail. `scripts/m_check.py` runs M with the start on.
+
+Changes `rank_one.mul_acc` and the order of two calls in `RankOne.convert`. At G: 2,939,472 -> 2,939,412 CCX (-60), 4,096 wires.
+
+## The residue's nonzero test read once (RankOne._and_nonzero)
+
+`residue` twice needs ctl ^= sigma·[N ≠ 0]. It made a copy of [N ≠ 0] on a fresh wire, which builds the zero chain and takes it down, used it in one CCX, and cleared the copy, which builds and takes down the chain again: 4(w - 1) CCX for one product.
+`_and_nonzero(C, x, ctl, t)` builds the chain once, does t ^= ctl·[x ≠ 0] as a CX and a CCX from the chain's top, and takes it down: 2(w - 1) + 1, and one wire fewer. N does not change between the old copy and its clear, so the product is the same.
+
+`scripts/nonzero_check.py` runs every (x, ctl, t) for 1 to 8 wires, and all 192 single-CCX mutants fail; `scripts/m_check.py` runs M with the start on.
+
+Adds `RankOne._and_nonzero` and changes two three-line stretches of `RankOne.residue`. At G: 2,939,412 -> 2,939,188 CCX (-224), 4,096 wires.
+
+## The fold's probe read off the carry sweep (RankOne.fold)
+
+The fold's probe needs e ^= top·[prod + lo ≥ 2^W], with top the Prefix's AND of the high bits. It copied the carry onto a fresh wire c1 with `carry_into`, a sweep up and a sweep down, did `ccx(top, c1, e)`, and cleared c1 with a second `carry_into`: 4W CCX.
+`carry_into` already takes a control for its one write, so `carry_into(C, prod, lo[:W], e, ctl=top)` writes the product straight from the sweep's top wire: 2W + 1 CCX and no c1. prod, lo and top do not change between the old copy and its clear, and the sweep reads only prod and lo[:W], which the Prefix's wires are not among, so e takes the same value.
+Without high bits the write is the plain CX, as before.
+
+The toy primes' folds have no high bits, so they run only the uncontrolled write, before and after this change. `scripts/probe_check.py` therefore builds the old stretch and the new call on the same wires for W = 1 to 6 and runs every (prod, lo, top, e): both leave e ⊕ top·carry and everything else as found; the call without its control and all its single-CCX mutants differ, 150 in all. `scripts/m_check.py` runs M with the start on at q = 61, 251, 4093 and 8191, and `accept.py` samples secp256k1.
+
+Changes eight lines of `RankOne.fold` (the c1 stretch) and nothing else; the fold holds one wire fewer there. At G: 2,939,188 -> 2,938,804 CCX (-384), 4,096 wires.
+
+## The residue's U - N with the 1 as a carry in (rank_one.add cin)
+
+`residue` maps N to U - N under ctl as ~N + 1 + U: a complement by CX, an increment under ctl at 2 CCX a bit, and an add of U under ctl at 3.
+The increment is the add's carry in. `rank_one.add` gains `cin`: the wire's bit is copied onto the adder's own carry-in wire by a CX before the ripple and taken off after, and the ripple restores that wire as it does any carry. Under a control only the writes onto b are gated, so with cin = ctl the add writes ~N + U + 1 when ctl is 1 and nothing when it is 0.
+The increment is gone: 2(w - 1) CCX each time.
+
+`scripts/addcin_check.py` builds the old stretch and the new one for 1 to 6 wires and runs every (U, N, ctl): both leave (U - N) mod 2^n under ctl, N otherwise. It also checks the uncontrolled add with a carry in against b + a + c. The stretch without its carry in and all its single-CCX mutants fail: 158, none unnoticed. `scripts/m_check.py` runs M with the start on.
+
+Changes `rank_one.add` (new optional argument, no change without it) and one stretch of `RankOne.residue`. At G: 2,938,804 -> 2,938,692 CCX (-112), 4,096 wires.
+
+## Five wires off M's peak in the rank-one start
+
+M's widest moment is the rank-one start's conversion, not a tick: at `CARRY_JUNK` = 1279 the fold's corrected product, the residue and the small pass all stood within six wires of M's 4,093.
+Three changes in `qec/rank_one.py` take 5 wires off all of them, and `CARRY_JUNK` goes from 1279 to 1284 at the same 4,096 wires. None changes the map of any block, and none depends on q.
+
+**The fold lends its zero wires.** With f = 2^t + c, the product's own wires are c*(hi + 1) on `low` and zero wires from there up to t, 6 at n = 256.
+Those wires are only places for a ripple's carries to pass: `_times` writes `low` alone, and the probe's `carry_into` and the final MAJ/UMA ladder leave their a wires as found.
+So `product()` takes them just before each ripple and the fold frees them after it, and the corrections between the probe and the write, `dec` on hi and the controlled constant add on `low`, the fold's widest steps, run on them.
+
+**The small pass runs before the residue.** `small_pass` acts on (cells, U, mR, sp) and `residue` on (U, D, Q). They share only U, and each leaves U as found on every input, so as permutations of basis states they commute.
+The pass maps (mR, 0) to (0, V*mR mod U), which the tree already relied on when it freed mR and sp's top wire at the end. Run first, it gives mR's w wires and sp's top back before Q is taken, so the pass no longer holds Q and the residue holds sp's w wires in place of mR's.
+The residue, the XOR that clears sp against D mod U and the residue's inverse follow unchanged.
+
+**An incrementer on its own carries.** `inc(x, ctl)` was an adder with a one-wire addend, zero-extended: k - 1 zero wires, a carry-in and a copy of ctl. It is now the chain c_1 = ctl x_0, c_(i+1) = c_i x_i on k - 1 wires.
+From the top down, x_i takes c_i and then c_i is cleared by the AND that made it, whose inputs c_(i-1) and x_(i-1) are still as found; x_0 takes ctl last. 2(k - 1) CCX as before, two wires fewer. `dec` is `inc` between complements, since ~(~x + c) = x - c.
+With no control it adds the constant 1, which the fold's hi + 1 and the conversion's -x = ~x + 1 did with a wire set to 1: x_0 itself is the carry into bit 1, so the chain is one AND shorter, 2 CCX less at each of three places a start.
+
+At G: M's peak 4,093 -> 4,088 wires at `CARRY_JUNK` 1279; at 1284 the build is 4,096 wires again (1285 gives 4,097).
+2,938,692 -> 2,938,640 CCX (-52): -40 from the five junk wires, -12 from the constant increments. The residue's steps (4,088 and 4,087 at 1279) and the fold's constant add (4,087) now sit together, and the small pass is 10 below, so a sixth wire needs the residue's chain of 14 `small` wires, its zero test and the fold's 24 carries all cut.
+
+**Checks.** `scripts/start_wires_check.py`: `inc` (with and without a control) and `dec` on every input of 1 to 7 bits with every other wire 0 after; `residue` on every U in [1, 2^w) and D in (-2^w, 2^w) for w = 2 to 6; `fold` on every X < 2^w q at eight (q, w), six of them primes whose f splits with 1 to 4 lent wires (479, 991, 3967); M as gates on every (x, y) at q = 61, 127, 251 and 509, where the start runs with J = 3, 6, 4 and 7.
+Mutants, all caught: an incrementer without its low bit, one that clears its carries after the sum, and a wire flipped just before each `free` call of `fold` and `convert` (in M at q = 61 and 127, and in each fold), which is the claim that every wire these changes give back is clean and needed clean.
+The full `accept.py` passes: 13 pass, 0 fail, 1 pending.
+
+## J and the swap on one wire in the start's semantic cells
+
+A semantic cell of the rank-one start (the cofactors' cells, the small pass's, and the start's last tick) made j = b AND NOT g0 on a wire, used it, cleared it, then made sw = g0*b on a wire, used it and cleared it: 4 CCX.
+Since j = b ^ g0*b, `_kind` makes g0*b once and a CX from b turns it into j; after j's use `_kind_swap` turns it back into sw with the same CX; `_kind_off` clears it with the CCX that made it: 2 CCX.
+The gates between read g0 and b only (the cofactors' controlled double, the small pass's `_mod_double` under j, the last tick's double and its l0 = g0*R_0), so the wire holds exactly j where j was read and exactly sw where sw was read, and each cell's map is the same on every input. Nothing depends on q. The middle cells' `tick` already shared its wire this way.
+
+40 cells a start at n = 256 (13 cofactor cells run forward and back, 13 in the small pass, the last tick), 2 CCX each: 2,938,640 -> 2,938,480 CCX (-160), 4,096 wires, `CARRY_JUNK` stays 1284.
+
+**Checks.** `scripts/start_wires_check.py`'s M rows (every (x, y) at q = 61, 127, 251, 509) run every cell kind in all three places; two mutants are caught there: a cell that swaps on its J wire (no CX back), and a J wire that holds b.
+`scripts/m_check.py` (the start up to q = 8191, J = 12) and the full `accept.py` pass: 13 pass, 0 fail, 1 pending.
+
+### The three branches together
+
+The lazy run ending at 8 bits (`CARRY_JUNK` 1268 on its own branch) and the start's five wires (1279 -> 1284 on theirs) meet at `CARRY_JUNK` = 1273: 4,096 wires, and 1274 gives 4,097.
+At G with the square branch's rank-one commits, the start's wires and cells and the lazy end: 2,938,372 CCX. `start_wires_check.py`, `window_check.py`, `m_check.py` and the full `accept.py` pass on the merge: 13 pass, 0 fail, 1 pending.

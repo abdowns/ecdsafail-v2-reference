@@ -40,16 +40,88 @@ def _keep_add(C, a, b, cout, K):
         c = t
 
 
+def _maj_onto(C, a, b, c, t):
+    """t ^= MAJ(a, b, c) = c ^ (a ^ c)(b ^ c), with a, b and c left as they were. b or c may be
+    None for a 0."""
+    if b is None or c is None:
+        other = c if b is None else b
+        if other is not None:
+            C.ccx(a, other, t)
+        return
+    C.cx(c, a)
+    C.cx(c, b)
+    C.ccx(a, b, t)
+    C.cx(c, t)
+    C.cx(c, b)
+    C.cx(c, a)
+
+
+def _sum(C, A, B, S):
+    """S = A + B on len(A) + 1 clean wires, len(B) <= len(A). The carry into bit i + 1 is written
+    onto S[i + 1] while S[i] still holds the carry into bit i; then S[i] takes A[i] and B[i]. No
+    carry is ever cleared, so the sum costs one CCX a bit, where a copy and an in-place add cost two."""
+    assert len(S) == len(A) + 1 and len(B) <= len(A)
+    for i, a in enumerate(A):
+        b = B[i] if i < len(B) else None
+        _maj_onto(C, a, b, S[i] if i else None, S[i + 1])
+        C.cx(a, S[i])
+        if b is not None:
+            C.cx(b, S[i])
+
+
 def _rows(C, Y, Q, copy=True, K=None):
     """Q = Y*(2^w - Y) mod 2^len(Q) on len(Q) <= 2w clean wires, w = len(Y), or Y*(2^w - 1 - Y)
     without the copy. After row i, Q < 2^(w + i + 1), so each carry lands on a wire no earlier row
     reached; the uncopied sums are smaller. Y's wires walk through their Gray code. K, if given, is
     a list of junk wires, and a row whose inner carries fit there keeps them, at one CCX a bit."""
     n, L = len(Y), len(Q)
+    if n == 1:
+        if copy and L:
+            C.cx(Y[0], Q[0])
+        return
+    # Row 0 writes Q without an adder (ported from 2elliot's square branch, 6b1f34d). After the
+    # Gray step Y[j] holds y_j ^ y_0. Uncopied, Q is 0, so the row is a copy onto Q[1:n].
+    # Copied, Y + 2*(row 0) is 2Y when y_0 = 0 and 2^w - 1 when y_0 = 1: Q[0] = Q[1] = y_0,
+    # Q[k] = y_0 | y_(k-1) for 1 < k < w, and Q[w] = NOT y_0 AND y_(w-1), where
+    # NOT y_0 AND y_(k-1) = NOT y_0 AND (y_(k-1) ^ y_0) is read off the Gray wire. Bits at L
+    # and above are dropped, as the adder's would be mod 2^L.
+    for w in Y[1:]:
+        C.cx(Y[0], w)
     if copy:
-        for y, q in zip(Y, Q):
+        C.x(Y[0])
+        for k in range(2, min(n, L - 1) + 1):
+            C.ccx(Y[0], Y[k - 1], Q[k])
+        C.x(Y[0])
+        for q in Q[:min(n, L)]:
+            C.cx(Y[0], q)
+    elif n > 2:
+        # Uncopied, rows 0 and 1 land on a clean Q together: Q = 2*r_0 + 8*r_1 as an out-of-place
+        # sum, the carry into place p + 1 written onto Q[p + 1] while Q[p] holds the carry into p.
+        # After row 1's Gray step Y[j] holds r_1's bit y_j ^ y_1 for j >= 2 and Y[1] holds
+        # y_1 ^ y_0, so r_0's bit y_j ^ y_0 is Y[j] ^ Y[1], put on Y[j] by a CX for its one step.
+        for w in Y[2:]:
+            C.cx(Y[1], w)
+        for p in range(1, min(n + 1, L)):
+            a = Y[p] if p < n else None
+            b = Y[p - 1] if p >= 3 else None
+            if a is not None and p >= 2:
+                C.cx(Y[1], a)
+            if p + 1 < L and p >= 3:
+                c = Q[p] if p > 3 else None
+                if a is None:
+                    if c is not None:
+                        C.ccx(b, c, Q[p + 1])
+                else:
+                    _maj_onto(C, a, b, c, Q[p + 1])
+            for x in (a, b):
+                if x is not None:
+                    C.cx(x, Q[p])
+            if a is not None and p >= 2:
+                C.cx(Y[1], a)
+    else:
+        for y, q in zip(Y[1:], Q[1:n]):
             C.cx(y, q)
-    for i in range(n - 1):
+    for i in range(1 if copy or n <= 2 else 2, n - 1):
         for w in Y[i + 1:]:
             C.cx(Y[i], w)
         width = min(n - 1 - i, L - 2 * i - 1)
@@ -103,6 +175,16 @@ def _add_const_cin(C, reg, value, cin, cout=None, keep=()):
         if i > len(keep):
             _carry_into(C, reg[i - 1], value >> (i - 1) & 1, cs[i - 1], cs[i])
             C.free([cs[i]])
+
+
+def _add_loaded(C, reg, value):
+    """reg += value, for the constant a fold loads beside its first digit."""
+    add_const(C, reg, value)
+
+
+def _clean_from(values):
+    """The first bit from which a register holding one of these values, all at least 0, is 0."""
+    return max(values).bit_length()
 
 
 class _Lend:
@@ -215,11 +297,7 @@ def _karatsuba(C, Y, Q, J, thr, kind="R", K=None, exact=True, cins=frozenset(), 
     _karatsuba(C, B, Q[2 * h:], J, thr, "T", K)
     ws = h + 1
     S = [J.pop(0) for _ in range(ws)]
-    for x, s in zip(A, S):
-        C.cx(x, s)
-    pad = C.alloc(h - m)
-    add(C, B + pad, S[:h], cout=S[h])
-    C.free(pad)
+    _sum(C, A, B, S)
     W = [J.pop(0) for _ in range(lw)]
     if kind == "T":
         for x in S:
@@ -414,7 +492,7 @@ class SquareFold:
             i = j + 1
         return best
 
-    def _multiple(self, C, a, T, a_max, t_max=0, cin=None):
+    def _multiple(self, C, a, T, a_max, t_max=0, cin=None, load=False):
         """T += f*a mod 2^len(T), plus 1 if cin holds 1, for a <= a_max and T <= t_max on entry.
 
         Around each digit T holds t + d*a, plus 1 once cin is in, with d the digits so far.
@@ -422,7 +500,14 @@ class SquareFold:
         it bounds -v - 1 instead. Where every bound lies in [-2^i, 2^i) for a bit i at or above
         a's top, the digit's bits from i up all hold the sign. A sign that is always 0 never
         moves, so the digit adds below bit i only. Otherwise bit i takes the carry out and the
-        bits above copy it. A digit onto a T that is 0, with no carry in, copies a."""
+        bits above copy it. A digit onto a T that is 0, with no carry in, copies a.
+
+        A digit added onto a value that is at least 0 meets a target that is 0 from some bit z up
+        (_clean_from). Below z it ripples in place, with its carry out on target[z]; from z up the
+        carry into each next bit is written onto that clean wire and left there, one CCX a bit.
+
+        With load, T is clean on entry and the call also adds the constant t_max: the first digit
+        copies a and adds t_max as a constant, whose chain skips the 0 bits below its first 1."""
         inc, done, d = int(cin is not None), 0, 0
         for s, sign in self.digits:
             box = [(t, x) for t in (0, t_max) for x in (0, a_max)]
@@ -433,6 +518,16 @@ class SquareFold:
             target = T[s:]
             if not target:
                 continue
+            if load and not done and not d - (sign << s) and cin is None and sign > 0 and not s:
+                # T = a + t_max, below 2^top, so the constant's add carries nothing out.
+                top = (a_max + t_max).bit_length()
+                assert len(a) <= top <= len(T)
+                for x, w in zip(a, T):
+                    C.cx(x, w)
+                _add_loaded(C, T[:top], t_max)
+                load = False
+                continue
+            assert not load
             if not any(before) and cin is None and sign > 0:
                 for x, w in zip(a, target):
                     C.cx(x, w)
@@ -448,9 +543,20 @@ class SquareFold:
                 C.x(w)
             for w in above:
                 C.cx(target[top], w)
-            pad = C.alloc(max(0, top - len(a)))
-            add(C, a[:top] + pad, target[:top], cout=target[top] if carry else None, cin=cin)
-            C.free(pad)
+            # Before a digit that adds onto a value known to be at least 0, the target is 0 from
+            # bit z up. There the sum is out of place: the carry into bit p + 1, a_p AND c_p, is
+            # written onto the clean target[p + 1] and stays as part of the sum.
+            z = _clean_from(ends[:len(before)]) if sign > 0 and min(before) >= 0 else top
+            if not carry and 1 <= z <= len(a) and z < top:
+                add(C, a[:z], target[:z], cout=target[z], cin=cin)
+                for p in range(z, min(top, len(a))):
+                    if p + 1 < top:
+                        C.ccx(a[p], target[p], target[p + 1])
+                    C.cx(a[p], target[p])
+            else:
+                pad = C.alloc(max(0, top - len(a)))
+                add(C, a[:top] + pad, target[:top], cout=target[top] if carry else None, cin=cin)
+                C.free(pad)
             for w in above:
                 C.cx(target[top], w)
             for w in flips:
@@ -503,8 +609,7 @@ class SquareFold:
         C.free([one])
         if kE:
             add_const(C, E, kE)
-        load_const(C, T, klo)
-        self._multiple(C, E, T, f + kE, klo)
+        self._multiple(C, E, T, f + kE, klo, load=bool(klo))
         high = lo[m:]
         add(C, T, lo[:m], cout=t)
         if high:
