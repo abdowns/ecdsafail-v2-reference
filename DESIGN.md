@@ -828,3 +828,34 @@ The first round's predicted gain is close to what the circuit gains (36,809 pred
 **Why the function is unchanged.** Only two kinds of move exist, both identities: reordering gates that commute, and swapping the controls of a CCX.
 Before `slackopt` writes a body it runs the new body and the old one on 4,096 random basis states and exits with an error on any difference.
 `scripts/check_passes.py` runs all four passes on toy curves and checks every lane of each.
+
+## The tick and the Euclid step retuned on the cost after the slack pass
+
+The slack pass changes which generator settings are best, because it removes most of the waiting that copies and wire choices were tuned against.
+Two harnesses outside the repository score a setting on that cost.
+Each chains one body as calls, the way the pass chains it, forward and then as reversed twins in reverse order, runs `slackopt` on the bodies for two rounds, and reads the steady cycle in each direction.
+On the Bézout tick the harness gives 1,105 forward and 1,155 inverted where the full circuit's tick bodies cost 1,099 and 1,151.
+On the 256-bit Euclid step it gives 413 and 429 where the circuit's cost 413 and 428.
+
+**The tick.** A scan of 27 flags one at a time, then a search of 375 settings under the same CCX budget and width: `ONE_COPY` on, `WIDE_M` 3, `P_FAN` 32, `WIDE_ADD_TREE_B` (3, 1.8, 64, 2, 2), `wide.LOW_FALL_TREE` (None, 2, 8, 2, 2).
+The steady tick falls from 1,130 to 1,119 for 10 more CCX.
+`ONE_COPY` was a loss on the cost before the pass.
+
+**The Euclid step.** A step may take `STEP_FREE` = 270 free wires for two things: one copy of each select bit a bit, and the second-strip bit with its copies made before the shared difference, on two sets of wires that the pass alternates.
+Above width 133 both do not fit, and the step kept the select copies.
+After the pass the strip bit is worth more than the select copies at every width from 134 to 256.
+`_step_plan` now decides: both on two sets where that fits; else, with `STRIP_FIRST`, the select copies with the strip bit on one set where that fits (134 to 178), else the strip bit alone on two sets (179 to 256).
+
+| width | select copies only | new plan |
+|---:|---:|---:|
+| 256 | 421.0 | 411.5 |
+| 240 | 418.0 | 412.5 |
+| 208 | 413.5 | 406.5 |
+| 176 | 402.5 | 389.25 |
+| 160 | 389.5 | 373.0 |
+| 144 | 385.0 | 368.25 |
+
+Below 134 nothing changes. There the harness ranks the four layouts the same way at every width tried: both, strip bit only, select copies only, neither.
+
+The raw emit is slower with both retunes (1,669,700 to 1,695,337 ticks) and the passed circuit is faster.
+`scripts/carry_tree_check.py` part 5 checks the step under each of the three plans at widths 9 and 10, on the step's whole domain.

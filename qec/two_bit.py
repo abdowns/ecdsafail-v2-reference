@@ -195,7 +195,7 @@ HIGH_CARRIERS = True
 LATE_FINAL_WIRES = True
 LATE_MIN_COPIES = 6
 # Copies of p for un-copying it from the word after the add (1 = none).
-P_FAN = 64
+P_FAN = 32
 # Run the tick's add as 2elliot depth/v2's CDKM ripple instead of either add above: 579,096
 # fewer CCX on the whole circuit for 1,535,700 more ticks (measured after the post-pass).
 CDKM_ADD = False
@@ -229,14 +229,14 @@ COPY_IDLE = True
 WIDE_ADD_TREE_F = (2.0, 4, 64, 2, 2)
 # The rotation's swaps read J from the sweeps' temps as well, which are clean by then.
 WIDE_ADD_ROT_TEMPS = True
-WIDE_ADD_TREE_B = (2, 2.5, 128, 2, 2)
+WIDE_ADD_TREE_B = (3, 1.8, 64, 2, 2)
 # The second wave too. Left serial, it follows the backward sweep down the word, and the rotation
 # starts on the middle bits meanwhile; as a network it waits for the sweep's last bit.
 WIDE_WAVE_BACK = True
 # The tick's P and M as wide.PrefixTree in blocks of this many bits (0 = PrefixR and Prefix). With
 # WIDE_P the first chain's carriers are clean wires, not borrowed H wires.
 WIDE_P = 4
-WIDE_M = 4
+WIDE_M = 3
 # The tick's two low chains as wide.LowAdd in blocks of this many bits (0 = _chain_up and _chain_down).
 WIDE_LOW = 3
 # Give every scratch wire from the prefixes to the compare by when it comes free under the tick model,
@@ -261,7 +261,7 @@ K_SHORT = True
 # With the trial on copies: every bit of k += e one CCX after e (one CCX more a tick).
 K_FAST = True
 # A copy of the tick's lane bit for the second of its two swaps.
-ONE_COPY = False
+ONE_COPY = True
 SWAP_SPREAD = False
 
 

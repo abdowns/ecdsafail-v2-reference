@@ -257,6 +257,18 @@ two_bit.WIDE_WAVE, two_bit.WIDE_WAVE_BACK = saved
 
 
 # 4. The Euclid step with tree sweeps against the Brent-Kung sweep, on the step's whole domain.
+def plan_under(w, ring, **flags):
+    """point_add._step_plan under step_case's flags."""
+    flags = {"TWO_EARLY": 0, "STEP_FREE": 0, "RIPPLE_MAX_W": 0, **flags}
+    saved = {name: getattr(point_add, name) for name in flags}
+    for name, value in flags.items():
+        setattr(point_add, name, value)
+    plan = point_add._step_plan(w, ring)
+    for name, value in saved.items():
+        setattr(point_add, name, value)
+    return plan
+
+
 def step_case(w, geo, ring=None, **flags):
     """flags: point_add settings for this build (the early strip bit, the select copies on free
     wires, the per-width partitions); the defaults turn all three off."""
@@ -317,12 +329,19 @@ for w in range(9, WMAX + 1):
     wantr = sim.run(Cr.ops, Cr.num_wires, initr, 1 << N)
     assert ior == io and initr == init and Cr.ops != C0.ops
     part &= [wantr[x] for x in io] == [want[x] for x in io]
-    for flags in ({"TWO_EARLY": 128, "STEP_FREE": 12}, {"TWO_EARLY": 128, "STEP_FREE": 6, "TWO_ALTERNATE": False, "TWO_SPLIT": True},
+    # STEP_FREE 12 fits the select copies or the strip bit on two sets, not both: STRIP_FIRST picks.
+    # STEP_FREE 18 fits the select copies and the strip bit on one set.
+    for flags in ({"TWO_EARLY": 128, "STEP_FREE": 12, "STRIP_FIRST": True}, {"TWO_EARLY": 128, "STEP_FREE": 12, "STRIP_FIRST": False},
+                  {"TWO_EARLY": 128, "STEP_FREE": 18, "STRIP_FIRST": True},
+                  {"TWO_EARLY": 128, "STEP_FREE": 6, "TWO_ALTERNATE": False, "TWO_SPLIT": True},
                   {"STEP_FREE": 270},
                   {"EUCLID_GEO": {w: (2, 3, 4, 2, 2)}}, {"TWO_EARLY": 2, "STEP_FREE": 270, "EUCLID_GEO": {w: (2, 4, 2, 2, 2)}},
                   {"TWO_EARLY": 128, "STEP_FREE": 270, "EUCLID_GEO": {w: (2, 3, 8, 2, 2)}}):
         C1, init1, _, io1 = step_case(w, arith.SWEEP_GEO, ring=w - 2, **flags)
         assert io1 == io and init1 == init
+        if "STRIP_FIRST" in flags:
+            want_plan = {(12, True): (0, 5, 2), (12, False): (12, 0, 1), (18, True): (12, 5, 1)}[flags["STEP_FREE"], flags["STRIP_FIRST"]]
+            assert plan_under(w, w - 2, **flags) == want_plan, (w, flags)
 
         def passes(ops, C1=C1):
             st = sim.run(ops, C1.num_wires, init, 1 << N)

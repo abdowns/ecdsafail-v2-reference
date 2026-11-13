@@ -175,6 +175,10 @@ STEP_FREE = 270
 TWO_ALTERNATE = True
 # The early strip bit from two CCX that only read V[1] (one CCX more a step).
 TWO_SPLIT = False
+# Where a step has no room for the select bits' copies and the early strip bit on two sets of wires,
+# keep the strip bit: on one set beside the select copies if that fits, else alone on two. After the
+# slack pass that is faster than the select copies alone at every width from 134 to 256.
+STRIP_FIRST = True
 
 
 # Sweep partition (arith.carry_trees spec) for the Euclid step at each width where one beats
@@ -235,33 +239,48 @@ _EUCLID_GEO = {
 EUCLID_GEO = {w: spec for spec, widths in _EUCLID_GEO.items() for w in widths}
 
 
-def _select_extra(w, ring):
-    """Wires beyond a ring of that length for the select bits' copies: enough for one copy of each
-    a bit, or none (fewer do not shorten the step)."""
+def _step_plan(w, ring):
+    """What a step takes beyond a ring of that length: (wires for the select bits' copies, copies of
+    the early strip bit, sets of wires the pass alternates the strip bit between).
+
+    The select bits get one copy of each a bit or none (fewer do not shorten the step). The strip
+    bit's copies go on two sets of wires in turn where everything fits in STEP_FREE. Where it does
+    not, STRIP_FIRST keeps the strip bit: with the select copies on one set of wires if that fits,
+    else alone on two. Without STRIP_FIRST the select copies stay and the strip bit goes."""
     lay = ring_layout_u6(ring) if w > RIPPLE_MAX_W else None
-    if lay is None:
-        return 0
-    k = 2 * max(w - lay[0], 0)
-    return k if k <= STEP_FREE else 0
+    sel = 2 * max(w - lay[0], 0) if lay is not None else 0
+    if sel > STEP_FREE:
+        sel = 0
+    k = min((w - 1) // 2 + 1, TWO_EARLY) if TWO_EARLY and ring and w >= 4 else 0
+    if not k:
+        return sel, 0, 1
+    sets = 2 if TWO_ALTERNATE else 1
+    if sel + sets * (k + 1) <= STEP_FREE:
+        return sel, k, sets
+    if STRIP_FIRST:
+        if sel + k + 1 <= STEP_FREE:
+            return sel, k, 1
+        if sets * (k + 1) <= STEP_FREE:
+            return 0, k, sets
+    return sel, 0, 1
+
+
+def _select_extra(w, ring):
+    """Wires beyond a ring of that length for the select bits' copies."""
+    return _step_plan(w, ring)[0]
 
 
 def _step_scratch(w, ring):
-    """Wires a step takes beyond its ring for the early strip bit's copies. ring: the ring's
-    length. The select bits' copies come first; the strip bit's, on two sets of wires in turn,
-    only where both fit in STEP_FREE."""
-    if not (TWO_EARLY and ring and w >= 4):
-        return 0
-    k = min((w - 1) // 2 + 1, TWO_EARLY)
-    sets = 2 if TWO_ALTERNATE else 1
-    return k if _select_extra(w, ring) + sets * (k + 1) <= STEP_FREE else 0
+    """Wires a step takes beyond its ring for the early strip bit's copies. ring: the ring's length."""
+    return _step_plan(w, ring)[1]
 
 
 def _step_hold(w, ring):
     """Wires the pass holds through every other step, so that two steps in a row take different
-    scratch: the step's carry-in, and with the early strip bit that bit and its copies, which the
-    next step would otherwise wait for."""
-    k = _step_scratch(w, ring)
-    return 1 + (k + 1 if k and TWO_ALTERNATE else 0)
+    scratch: the step's carry-in, and where the strip bit alternates, that bit and its copies,
+    which the next step would otherwise wait for."""
+    _, k, sets = _step_plan(w, ring)
+    return 1 + (k + 1 if k and sets == 2 else 0)
 
 
 def _ring_size(w, avail):

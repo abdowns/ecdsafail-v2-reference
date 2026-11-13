@@ -388,7 +388,7 @@ class PrefixSplit:
 
 # write(aside=True) clears the carries below the quiet run by arith.CarrySweep over carry_trees'
 # (lo, hi, cap, fan, leaf), or None for one fall a bit, 11 ticks each in series.
-LOW_FALL_TREE = (2, 2, 2, 2, 2)
+LOW_FALL_TREE = (None, 2, 8, 2, 2)
 
 
 class LowAdd:
