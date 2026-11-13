@@ -789,3 +789,42 @@ The sections from "Blocks of 3 in the add's forward sweep" to "P's blocks after 
 Together, the full circuit has 1,250 wires, 7,114,217 CCX (T 49,799,519) and 5,387,028 ticks.
 After `qec/gate_pass.py` it has 5,349,345 ticks: qubit-time 6,686,681,250, against 7,334,902,500 for the combined head above and 7,909,085,166 for PR8.
 The two branches touch different functions, and their tick savings add up exactly.
+
+## Post-passes on the emitted circuit: direction split, reorder, slack reorder
+
+`qec/post_pass.py` runs four passes on the hierarchical circuit `scripts/emit.py` writes: `qec/split_dirs.py`, `qec/gate_pass.py`, `qec/reorder_pass.py` and `qec/slack_pass.py`.
+The first and third are ab-godder's, from PR #29's source, unchanged.
+The second is the gate pass every entry since PR #12 has used.
+The fourth is new.
+
+**What the slack pass scores.** The board's tick model is max-plus linear in the wires' ready times.
+A CCX with inputs ready at ra, rb, rt ends at x = max(ra + 8, rb + 10, rt + 11) and leaves its controls ready at x and its target at x − 1.
+So the model runs backward as well as forward: the longest path from a wire to the end of the circuit (its tail) obeys the transposed rule, and after a CCX with tails Ta, Tb, Tt the tails before it are M + 8, M + 10 and M + 11 with M = max(Ta, Tb, Tt − 1).
+`qec/slackopt.c` schedules the whole expanded circuit once forward and once backward.
+At every execution of a body it records when each of the body's wires is ready on entry and each wire's tail on exit.
+For one execution, the largest (ready on exit + tail) over the body's wires is the circuit's tick count through that execution with every other execution held fixed.
+The backward pass's largest tail at the start equals the forward tick count, and the tool refuses to run if it does not.
+
+**What `reorder_pass.py` scores, and why this differs.** That pass scores a body's own depth with every input ready at once.
+A body's inputs are not ready at once: they arrive when the body before it finished each of them, and its outputs do not all matter equally.
+On the circuit as it was before the retune in the next section, the slack pass alone, started from the split and gate-passed circuit, reaches fewer ticks on six bodies in two minutes than `reorder_pass.py` reaches on all of them in fourteen (1,583,764 against 1,586,630).
+Run after it on the entered circuit, the slack pass takes a further 2.6% (1,574,213 to 1,533,182).
+
+**The search.** Per body, over six executions spread across the run: minimise P, the sum of those executions' tick counts, then Q, the sum over gates of how far (gate time + tail after the gate) reaches above the execution's starting P less 24 ticks.
+Q is total negative slack: it falls when any near-critical path gets shorter, so the search keeps moving while several critical paths tie.
+The moves are `reorder_pass.py`'s: a gate and the gate before it on a wire trade places when they commute, and only if every gate between them that shares a wire with the moved gate commutes with it; and a CCX's two controls swap.
+Candidates are the binding edges of the critical gates.
+After a descent the search kicks the best order with four random legal moves and descends again, until its budget of scored orders is spent.
+The budget counts orders, not seconds, so a run is reproducible.
+A body longer than 8,192 gates is searched in windows of that size, twice, the second time shifted by half a window. A window's arrival times are the body's schedule up to it and its tails are the body's tails after it, so its P means the same thing.
+
+**Rounds.** `qec/slack_pass.py` runs the tool on every call-free body in parallel, puts all the new bodies in, and keeps them if the whole circuit's ticks fall.
+If they do not, it puts them in one at a time, largest predicted gain first.
+Then it measures arrivals and tails again and searches from the new orders.
+The first round's predicted gain is close to what the circuit gains (36,809 predicted, 34,943 measured on the entered circuit), and later rounds add little: with fixed arrivals a body hits the next path in, and that path only moves when every execution moves.
+
+**What was measured on the way.** Every execution of a body sees the same arrival profile to within the search's resolution: one execution alone gains 92 ticks, three gain 89 each and six gain 89 each on the Bézout tick. So cloning a body per call site would buy nothing, and the pass does not do it.
+
+**Why the function is unchanged.** Only two kinds of move exist, both identities: reordering gates that commute, and swapping the controls of a CCX.
+Before `slackopt` writes a body it runs the new body and the old one on 4,096 random basis states and exits with an error on any difference.
+`scripts/check_passes.py` runs all four passes on toy curves and checks every lane of each.
