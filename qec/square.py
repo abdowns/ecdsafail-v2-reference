@@ -14,10 +14,28 @@ Otherwise V - f < q, so subtracting f is enough. So no comparison with q is need
 from .arith import (_carries, _uncarry, add, add_const, add_lookahead, cadd_lookahead, fan_into, gt_into,
                     gt_lookahead, prefix_xor)
 from .two_bit import Prefix
+from .wide import PrefixSplit
 
 # Add the square's rows as lookahead trees, on ROW_TEMPS clean wires beside the fold's own.
 ROW_TREE = True
 ROW_TEMPS = 30
+# carry_trees' (lo, hi, cap, fan, leaf) for a row's add by its width, where SWEEP_GEO's is not the best.
+_ROW_GEO = (
+    ((1.5, None, 4, 2, 2), (3, 5)),
+    ((1.5, 1.5, 4, 2, 2), (4, 6, 7, 8)),
+    ((1.5, 2, 4, 2, 2), (10, 11)),
+    ((2, 2, 4, 2, 2), (12, 13, 15, 16, 17, 18, 19)),
+    ((1.5, 2, 8, 2, 2), (14, 20)),
+    ((3, 2, 8, 2, 2), (21,)),
+    ((2, 2, 8, 2, 2), (23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38, 39, 45)),
+    ((2, 2, 32, 2, 2), (40,)),
+    ((2.5, 2, 16, 2, 2), (41, 42, 43)),
+    ((1.5, 2, 32, 2, 2), (44,)),
+    ((2, 2, 16, 2, 2), (69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 93)),
+    ((2.5, 2, 32, 2, 2), (79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 90, 91, 92)),
+    ((2, 2.5, 32, 2, 2), (88,)),
+)
+ROW_GEO = {w: spec for spec, widths in _ROW_GEO for w in widths}
 # Fan each row's Gray-code step out through at most this many copies on clean temps, and undo the walk
 # by a prefix network; 0 runs both as CX chains.
 ROW_FAN_COPIES = 63
@@ -28,11 +46,24 @@ MODADD_TEMPS = 95
 MODADD_COPIES = 15
 # Run the fold's adds as add_lookahead trees, on FOLD_TEMPS clean wires and the fold's clean junk.
 FOLD_TREE = True
-FOLD_TEMPS = 126
+FOLD_TEMPS = 136
 # Split the rows once (Karatsuba): the pairs inside each half of Y add side by side on the two
 # halves of Q, and the pairs across the halves come from the rows of the halves' sum, a quarter
 # fewer row bits in all. The sum's rows and the sum stay on junk wires.
 SPLIT_ROWS = True
+# Run the split's three runs of rows side by side: the sum of the halves is made first, and each
+# run's adds take the wires of its own target that no row has reached yet as their temps.
+ROWS_ABREAST = True
+# Add the carries into the words' high parts by wide.PrefixSplit trees with blocks of this many bits,
+# on the clean wires the rows and the adds have given back; 0 keeps Prefix's chains.
+CARRY_TREE = 4
+# The same in modadd, which runs beside everything compute leaves live: larger blocks, for fewer wires.
+MODADD_CARRY_TREE = 5
+
+
+def _prefix(C, bits, block, top=True):
+    """Prefix's AND and increment over bits: a tree with blocks of `block` bits, or Prefix for 0."""
+    return PrefixSplit(C, bits, block, top) if block else Prefix(C, bits)
 
 
 def _add(C, a, b, cin=None, temps=()):
@@ -98,7 +129,7 @@ class SquareFold:
         else:
             add(C, a, b, top, ctrl)
         cs = _carries(C, b[:w + 1], f)
-        carry = Prefix(C, b[w:])
+        carry = _prefix(C, b[w:], MODADD_CARRY_TREE)
         # s's top bit and the carry into it are never both 1, so their XOR is the flag.
         C.ccx(cs[w], carry.top, top)
         C.ccx(top, cs[w], t)
@@ -118,11 +149,12 @@ class SquareFold:
             gt_into(C, a, b, top, ctrl)
         C.free([top, t])
 
-    def _pair_rows(self, C, Y, Q, temps, cin=None):
+    def _pair_rows(self, C, Y, Q, temps, cin=None, lend=False):
         """Q += the sum over i < j of (y_i ^ y_j)*2^(i + j), with Q below 2^len(Y) on entry. After
         row i, Q < 2^(len(Y) + i + 1), so each carry lands on a wire no earlier row reached. Y's wires
         walk through their Gray code. The rows add in series, each with add_lookahead on clean temps.
-        cin: a clean wire for the adds' carry in, so that two runs side by side share no wire."""
+        cin: a clean wire for the adds' carry in, so that two runs side by side share no wire.
+        lend: row i's add also takes Q's wires above its carry out, clean until row i + 1, as temps."""
         n = len(Y)
         for i in range(n - 1):
             if ROW_FAN_COPIES:
@@ -132,7 +164,9 @@ class SquareFold:
             else:
                 for w in Y[i + 1:]:
                     C.cx(Y[i], w)
-            add_lookahead(C, Y[i + 1:], Q[2 * i + 1:n + i], Q[n + i], temps, tree=ROW_TREE, cin=cin)
+            lent = Q[n + i + 1:] if lend else []
+            add_lookahead(C, Y[i + 1:], Q[2 * i + 1:n + i], Q[n + i], lent + list(temps), tree=ROW_TREE, cin=cin,
+                          spec=ROW_GEO.get(n - 1 - i))
         if ROW_FAN_COPIES:
             prefix_xor(C, Y)
         else:
@@ -167,19 +201,31 @@ class SquareFold:
         Y0, Y1, lo, hi = Y[:h], Y[h:], Q[:2 * h], Q[2 * h:]
         extra = C.alloc(ROW_TEMPS) if ROW_TREE else []
         cin, *temps = list(temps) + extra
-        spare = temps + list(K) + list(S)
-        cut = len(spare) // 2
         for y, q in zip(Y0, lo):
             C.cx(y, q)
-        self._pair_rows(C, Y0, lo, spare[1:cut], spare[0])
-        self._pair_rows(C, Y1, hi, spare[cut + 1:], spare[cut])
-        start = len(C.prims)
-        for y, s in zip(Y0, S):
-            C.cx(y, s)
+
+        def make_sum():
+            start = len(C.prims)
+            for y, s in zip(Y0, S):
+                C.cx(y, s)
+            add_lookahead(C, Y1 + pad, S[:h], S[h], temps, tree=True, cin=cin)
+            return C.prims[start:]
+
         pad = C.alloc(h - len(Y1))
-        add_lookahead(C, Y1 + pad, S[:h], S[h], temps, tree=True, cin=cin)
-        made = C.prims[start:]
-        self._pair_rows(C, S, K, temps, cin)
+        if ROWS_ABREAST and ROW_TREE:
+            made = make_sum()
+            c0, c1, *rest = temps
+            third = len(rest) // 3
+            self._pair_rows(C, Y0, lo, rest[:third], c0, lend=True)
+            self._pair_rows(C, Y1, hi, rest[third:2 * third], c1, lend=True)
+            self._pair_rows(C, S, K, rest[2 * third:], cin, lend=True)
+        else:
+            spare = temps + list(K) + list(S)
+            cut = len(spare) // 2
+            self._pair_rows(C, Y0, lo, spare[1:cut], spare[0])
+            self._pair_rows(C, Y1, hi, spare[cut + 1:], spare[cut])
+            made = make_sum()
+            self._pair_rows(C, S, K, temps, cin)
 
         def take(addend, target):
             fill = C.alloc(len(target) - len(addend))
@@ -258,7 +304,7 @@ class SquareFold:
             add(C, T, lo[:m], cout=t)
         C.free(fold)
         if high:
-            carry = Prefix(C, high)
+            carry = _prefix(C, high, CARRY_TREE)
             C.ccx(t, carry.top, c)
             carry.write(t)
         else:
@@ -270,7 +316,7 @@ class SquareFold:
         high = lo[b:]
         for w in high:
             C.x(w)
-        Prefix(C, high).write(k)
+        _prefix(C, high, CARRY_TREE, top=False).write(k)
         for w in high:
             C.x(w)
         C.x(c)

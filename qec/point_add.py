@@ -40,13 +40,15 @@ def _unfanout(C, src, copies):
     for h, t in reversed(rec):
         C.cx(h, t)
 
-def _par_rotate(C, two, V, cp):
-    """Rotate V left by one under `two`: reverse V[0..L-1], then reverse V[0..L-2]."""
+def _par_rotate(C, two, V, cp, fanned=False):
+    """Rotate V left by one under `two`: reverse V[0..L-1], then reverse V[0..L-2]. fanned: cp
+    already holds two's copies; they are cleared here either way."""
     L = len(V)
     # With fewer clean wires than L // 2 - 1, the copies are shared round-robin; the rotation is
     # the same permutation, only less parallel.
     ctl = [two] + cp
-    _fanout(C, two, cp)
+    if not fanned:
+        _fanout(C, two, cp)
     for p in range(L // 2):
         cswap(C, ctl[p % len(ctl)], [V[p]], [V[L - 1 - p]])
     for p in range((L - 1) // 2):
@@ -162,6 +164,123 @@ TICK0_COPIES = 31
 # of a full ring take 42 at most, and the pass runs further than that below the circuit's peak, so
 # they cost no wire.
 RING_BORROW = 300
+# The Euclid step makes its second-strip bit and up to this many copies of it before its shared
+# difference, on wires outside the ring (0 = after it, on the ring). The pass leaves about 275
+# wires free under the circuit's width.
+TWO_EARLY = 128
+# Wires a Euclid step may take outside its ring. Through the Euclid pass at least 275 wires are
+# free under the circuit's width, which the Bezout ticks set.
+STEP_FREE = 270
+# Two steps in a row take that bit and its copies from different wires.
+TWO_ALTERNATE = True
+# The early strip bit from two CCX that only read V[1] (one CCX more a step).
+TWO_SPLIT = False
+# Where a step has no room for the select bits' copies and the early strip bit on two sets of wires,
+# keep the strip bit: on one set beside the select copies if that fits, else alone on two. After the
+# slack pass that is faster than the select copies alone at every width from 134 to 256.
+STRIP_FIRST = True
+
+
+# Sweep partition (arith.carry_trees spec) for the Euclid step at each width where one beats
+# arith.SWEEP_GEO's on the emitted, chained step, both directions (0.3 ticks charged a CCX).
+_EUCLID_GEO = {
+    (2, 4, 32, 2, 2): (
+        80, 81, 82, 83, 84, 85, 97, 98, 99, 115, 130, 133, 141, 142, 145, 146, 148, 149, 177
+    ),
+    (2, 2, 16, 2, 2): (
+        69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 88, 89, 91, 92
+    ),
+    (2, 3, 64, 2, 2): (
+        160, 161, 162, 163, 164, 165, 166, 224, 225, 226, 227, 228, 229, 230, 256
+    ),
+    (2, 2, 8, 2, 2): (
+        23, 24, 27, 28, 29, 31, 32, 36, 37, 38, 39, 46, 47
+    ),
+    (2, 2, 48, 2, 2): (
+        86, 87, 90, 93, 106, 107, 109, 174, 175, 204, 205, 222, 223
+    ),
+    (2, 3, 48, 2, 2): (
+        136, 192, 193, 194, 195, 196, 197, 198, 199
+    ),
+    (2, 2, 24, 2, 2): (
+        44, 45, 49, 50, 51, 96, 100
+    ),
+    (2, 2, 4, 2, 2): (
+        14, 15, 18, 19, 21
+    ),
+    (2, 2, 12, 2, 2): (
+        42, 43, 48, 54, 66
+    ),
+    (2, 3, 32, 2, 2): (
+        128, 129, 132, 134, 135
+    ),
+    (2, 4, 4, 2, 2): (
+        13, 16, 17
+    ),
+    (2, 4, 8, 2, 2): (
+        25, 26, 35
+    ),
+    (2, 3, 8, 2, 2): (
+        33, 34
+    ),
+    (2, 3, 12, 2, 2): (
+        40, 41
+    ),
+    (2, 4, 16, 2, 2): (
+        67, 68
+    ),
+    (2, 2, 32, 2, 2): (
+        189,
+    ),
+    (2, 3, 4, 2, 2): (
+        20,
+    ),
+}
+EUCLID_GEO = {w: spec for spec, widths in _EUCLID_GEO.items() for w in widths}
+
+
+def _step_plan(w, ring):
+    """What a step takes beyond a ring of that length: (wires for the select bits' copies, copies of
+    the early strip bit, sets of wires the pass alternates the strip bit between).
+
+    The select bits get one copy of each a bit or none (fewer do not shorten the step). The strip
+    bit's copies go on two sets of wires in turn where everything fits in STEP_FREE. Where it does
+    not, STRIP_FIRST keeps the strip bit: with the select copies on one set of wires if that fits,
+    else alone on two. Without STRIP_FIRST the select copies stay and the strip bit goes."""
+    lay = ring_layout_u6(ring) if w > RIPPLE_MAX_W else None
+    sel = 2 * max(w - lay[0], 0) if lay is not None else 0
+    if sel > STEP_FREE:
+        sel = 0
+    k = min((w - 1) // 2 + 1, TWO_EARLY) if TWO_EARLY and ring and w >= 4 else 0
+    if not k:
+        return sel, 0, 1
+    sets = 2 if TWO_ALTERNATE else 1
+    if sel + sets * (k + 1) <= STEP_FREE:
+        return sel, k, sets
+    if STRIP_FIRST:
+        if sel + k + 1 <= STEP_FREE:
+            return sel, k, 1
+        if sets * (k + 1) <= STEP_FREE:
+            return 0, k, sets
+    return sel, 0, 1
+
+
+def _select_extra(w, ring):
+    """Wires beyond a ring of that length for the select bits' copies."""
+    return _step_plan(w, ring)[0]
+
+
+def _step_scratch(w, ring):
+    """Wires a step takes beyond its ring for the early strip bit's copies. ring: the ring's length."""
+    return _step_plan(w, ring)[1]
+
+
+def _step_hold(w, ring):
+    """Wires the pass holds through every other step, so that two steps in a row take different
+    scratch: the step's carry-in, and where the strip bit alternates, that bit and its copies,
+    which the next step would otherwise wait for."""
+    _, k, sets = _step_plan(w, ring)
+    return 1 + (k + 1 if k and sets == 2 else 0)
 
 
 def _ring_size(w, avail):
@@ -179,24 +298,29 @@ def ring_layout_u6(n):
     return n // 2, n
 
 
-def _fan(C, src, copies):
-    """CX src into each clean copy by doubling: depth about log2(len(copies) + 1)."""
+def _fan(C, src, copies, stop=None):
+    """CX src into each clean copy by doubling: depth about log2(len(copies) + 1). With stop, only
+    the copies before that index, for a tree whose later copies are already there: each gate's
+    source is src or an earlier copy, and a copy keeps its value while its source is cleared."""
     have = [src]
     todo = list(copies)
+    made = 0
     while todo:
         new = []
         for s in have:
             if not todo:
                 break
             d = todo.pop(0)
-            C.cx(s, d)
+            if stop is None or made < stop:
+                C.cx(s, d)
+            made += 1
             new.append(d)
         have += new
 
 
-def _unfan(C, src, copies):
+def _unfan(C, src, copies, stop=None):
     g = _Gates()
-    _fan(g, src, copies)
+    _fan(g, src, copies, stop)
     _emit(C, reversed(g.ops))
 
 
@@ -215,6 +339,14 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
     assert w >= 2 and lay is not None
     r, _ = lay
     G0, G1 = list(ring[:r]), list(ring[r:2 * r])
+    # A copy of g0 and of g1 for every bit: the ring holds half of them, the rest sit on wires
+    # that are free through the whole pass, so no bit's select waits for another bit's.
+    more = C.alloc(_select_extra(w, len(ring)))
+    x = len(more) // 2
+    ringed = len(G0)
+    G0 += more[:x]
+    G1 += more[x:]
+    r = len(G0)
     (cin,) = C.alloc(1)
     for wire in V:
         C.x(wire)
@@ -223,7 +355,7 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
         up.cx(U[i], V[i])
     up.cx(U[0], cin)
     adjacent_xor(up, U)
-    lookahead_sweep(up, [cin] + list(U), [None] + list(V), list(ring))
+    lookahead_sweep(up, [cin] + list(U), [None] + list(V), list(ring), EUCLID_GEO.get(w))
     _emit(C, up.ops)
     _fan(C, g0, G0)
     C.ccx(g0, U[-1], g1)
@@ -233,11 +365,12 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
         C.ccx(G1[i % r], V[i], k)
         C.ccx(G0[i % r], k, V[i])
         C.cx(G0[i % r], V[i])
-    _unfan(C, g1, G1)
-    _unfan(C, g0, G0)
+    # The ring's copies make way for the sweep's temps; the others stay for the last layer.
+    _unfan(C, g1, G1, ringed)
+    _unfan(C, g0, G0, ringed)
     _emit(C, reversed(up.ops))
-    _fan(C, g0, G0)
-    _fan(C, g1, G1)
+    _fan(C, g0, G0, ringed)
+    _fan(C, g1, G1, ringed)
     for i in range(w):
         C.cx(G1[i % r], U[i])
         C.x(V[i])
@@ -247,6 +380,7 @@ def shared_difference_u6(C, U, V, g0, g1, ring):
     _unfan(C, g1, G1)
     _unfan(C, g0, G0)
     C.free([cin])
+    C.free(more)
 
 
 # Widths at which the step uses the in-place ripple below instead of a ring variant: there it has
@@ -314,6 +448,8 @@ def shared_difference_ripple(C, U, V, g0, g1, ring):
 
 # Hand each Bezout tick's B1 mark to the next tick when nothing runs between them.
 HAND_OFF_MARK = True
+# The mark also crosses a codec call between two ticks, which is on other cells.
+HAND_OFF_ACROSS = True
 
 # Run the Bezout pass's block codec calls on the free wires freed longest ago.
 CODEC_ASIDE = True
@@ -491,24 +627,51 @@ class DialogMultiplier:
                 offset = E[0]
                 C.cx(offset, V[0])
                 C.cx(V[0], g0)
+
+                def strip(bit):
+                    # two = [no subtract and the bit under V's lowest equals E's].
+                    C.cx(offset, bit)
+                    C.x(g0)
+                    C.x(bit)
+                    C.ccx(g0, bit, two)
+                    C.x(bit)
+                    C.x(g0)
+                    C.cx(offset, bit)
+
+                # two reads V[1] where there is no subtract, and there the difference leaves V
+                # alone, so it and its copies are made before the difference instead of after
+                # it, on wires that are free through the whole pass.
+                early = _step_scratch(w, len(cp))
+                if early:
+                    (two,) = C.alloc(1)
+                    if TWO_SPLIT:
+                        # The same bit as ~g0 V[1] ^ ~g0 E ^ ~g0: V[1] is read once and not written,
+                        # so the difference's first gate on it waits 8 ticks and not 12.
+                        C.x(g0)
+                        C.ccx(g0, V[1], two)
+                        C.ccx(g0, offset, two)
+                        C.cx(g0, two)
+                        C.x(g0)
+                    else:
+                        strip(V[1])
+                    tc = C.alloc(early)
+                    _fanout(C, two, tc)
                 self._shared_difference(U[:w], V[:w], g0, b, list(cp))
                 V[:] = V[1:] + V[:1]
                 # A no-subtract tick strips a second bit when V + E is even.
-                (two,) = C.alloc(1)
-                C.cx(offset, V[0])
-                C.x(g0)
-                C.x(V[0])
-                C.ccx(g0, V[0], two)
-                C.x(V[0])
-                C.x(g0)
-                C.cx(offset, V[0])
-                C.cx(two, b)
-                C.ccx(two, offset, V[0])
+                if not early:
+                    (two,) = C.alloc(1)
+                    strip(V[0])
+                C.cx(tc[-1] if early else two, b)
+                C.ccx(tc[-1] if early else two, offset, V[0])
                 # A subtract keeps its swap on E and moves the old offset to the cell. It follows
                 # the gates above so that `two` does not wait for it: on g0 they do nothing (two
                 # is 0 and the two CXs from offset cancel), and off g0 the swap does nothing.
                 cswap(C, g0, [offset], [b])
-                if cp:
+                if early:
+                    _par_rotate(C, two, V[:w - 1], tc, fanned=True)
+                    C.free(tc)
+                elif cp:
                     _par_rotate(C, two, V[:w - 1], list(cp))
                 else:
                     for i in range(w - 2):
@@ -598,11 +761,11 @@ class DialogMultiplier:
                 self.C.apply(tick0, [U, V, E, cell, available[:k]])
             else:
                 # Alternate clean scratch so adjacent carry and strip sweeps can overlap.
-                hold = self.C.alloc(1) if i % 2 else []
                 k = _ring_size(w, len(available))
                 full = tree_temps(w + 1, 1)
-                borrow = (self.C.alloc(full - len(available))
-                          if WIDE_RING and k < full <= len(available) + RING_BORROW else [])
+                nb = full - len(available) if WIDE_RING and k < full <= len(available) + RING_BORROW else 0
+                hold = self.C.alloc(_step_hold(w, len(available) + nb if nb else k)) if i % 2 else []
+                borrow = self.C.alloc(nb)
                 ring = available + borrow if borrow else available[:k]
                 self.C.apply(self._euclid_step(w, len(ring)), [U[:w], V, E, cell, ring])
                 self.C.free(borrow)
@@ -725,18 +888,34 @@ class DialogMultiplier:
         tail_encoded = False
 
         def quiet(i):
-            """Nothing is emitted between tick call i and tick call i - 1, which has a prev."""
+            """Tick call i can leave its cell's mark for tick call i - 1: that tick has a prev, and
+            nothing emitted between the two touches cell i. A block's encode, the tail's code and
+            the next block's decode work on other cells; the block-0 hold and the terminal cell's
+            release do not."""
             j = i - 1
             if not HAND_OFF_MARK or i == T - 1 or j < 0:
                 return False
+            hold = j == 1 and self.blocks
+            np = lend_tail and j == T - 2
+            if hold or np:
+                return False
+            if HAND_OFF_ACROSS:
+                return True
             enc = (i + 1) % TICKS == 0 and i + 1 < T and (i + 1) // TICKS < self.blocks
             tl = tail and i == T - tail_code.CELLS - 1
             dec = j % TICKS == 0 and 0 <= j // TICKS - 1 < self.blocks
-            hold = j == 1 and self.blocks
-            np = lend_tail and j == T - 2
-            return not (enc or tl or dec or hold or np)
+            return not (enc or tl or dec)
 
-        hand, mark_at = None, None
+        def untouched(since, wires):
+            """No primitive or call emitted since `since` is on any of `wires`."""
+            at, call = since
+            ops = C.prims[4 * at:]
+            used = set(ops[1::4]) | set(ops[2::4]) | set(ops[3::4])
+            for c in (C.calls or ())[call:]:
+                used.update(c.wires)
+            return not used & set(wires)
+
+        hand, mark_at, mark_cell = None, None, None
         for i in reversed(range(T)):
             nxt_block = i // TICKS - 1
             if i % TICKS == 0 and 0 <= nxt_block < self.blocks:
@@ -769,15 +948,16 @@ class DialogMultiplier:
             else:
                 consume, produce = hand is not None, quiet(i)
                 if consume:
-                    # The mark is valid only if nothing ran since the tick that made it.
-                    assert mark_at == (len(C.prims), len(C.calls or ())) and not first
+                    # The mark is NOR of the cell before, so it holds only while nothing since the
+                    # tick that made it has been on that cell or on the mark.
+                    assert not first and mark_cell == prev and untouched(mark_at, prev + [hand])
                 pin = [hand] if consume else []
                 pout = C.alloc(1) if produce else []
                 C.apply(self._bezout_tick(first, last, pebble, consume, produce),
                         [prev, G[2 * i:2 * i + 2], nxt, Yr, S, pin, pout])
                 C.free(pin)
                 hand = pout[0] if produce else None
-                mark_at = (len(C.prims), len(C.calls or ()))
+                mark_at, mark_cell = (len(C.prims), len(C.calls or ())), G[2 * i:2 * i + 2]
             prev_block = (i + 1) // TICKS
             if (i + 1) % TICKS == 0 and i + 1 < T and prev_block < self.blocks:
                 _aside(C, lambda: C.free(self._encode(G, prev_block, swept)))

@@ -133,6 +133,57 @@ def gt_tree(C, A, B, t, ctrl, block=4):
     C.free(taken[::-1])
 
 
+def gt_sweep(C, A, B, t, ctrl, spec):
+    """gt_tree's map, t ^= ctrl * [A > B], as one arith.CarrySweep that stops short of its fixes.
+
+    With B complemented, B ^= A and A's adjacent XORs put the carries of A + ~B in the sweep's
+    form, U[j + 1] ^= U[j] B[j] from a clean carry-in below A. Only the carry out is read, so
+    each block gives its local values and its product, the chain crosses the blocks once on the
+    way up, and the same gates backwards put everything back: no fix, and each product is made
+    and cleared once. spec is arith.carry_trees' (lo, hi, cap, fan, leaf)."""
+    from .arith import CarrySweep, _Gates, _emit, adjacent_xor, carry_trees
+    assert len(A) == len(B) >= 1 and ctrl not in (*A, *B, t)
+    A, B = list(A), list(B)
+    (cin,) = C.alloc(1)
+    taken = []
+
+    def take():
+        (w,) = C.alloc(1)
+        taken.append(w)
+        return w
+
+    wave = _Gates()
+    for a, b in zip(A, B):
+        wave.cx(a, b)
+    wave.cx(A[0], cin)
+    adjacent_xor(wave, A)
+    for x in B:
+        C.x(x)
+    _emit(C, wave.ops)
+    U = [cin] + A
+    sweep = CarrySweep(C, U, B, take, lambda w: None)
+    trees = carry_trees(len(A), spec)
+    for root in trees:
+        if root["kids"] is not None:
+            sweep.up(root)
+        C.ccx(U[root["s"]], sweep.beta(root), U[root["e"]])
+    C.ccx(ctrl, U[-1], t)
+    for root in reversed(trees):
+        C.ccx(U[root["s"]], sweep.beta(root), U[root["e"]])
+        if root["kids"] is not None:
+            sweep.unlocal(root)
+    _emit(C, reversed(wave.ops))
+    for x in B:
+        C.x(x)
+    C.free(taken[::-1])
+    C.free([cin])
+
+
+# The products write() rebuilds on the complemented bits serve only its carries and its hook: each
+# block's as a balanced tree, since no inner prefix is read, and none that neither reads.
+LEAN_REBUILD = True
+
+
 class PrefixTree:
     """AND(bits) on .top, and write(t): bits += t mod 2^len(bits), on clean scratch.
 
@@ -187,9 +238,32 @@ class PrefixTree:
     def restore(self):
         pass
 
-    def write(self, t, mid=None):
-        """mid(z), when given, runs while z holds AND(~new bits), before t's last use: t * z is
-        the carry out of the bits, t * AND(old bits)."""
+    def _rebuild(self, top):
+        """The tape that puts AND(~bits) of every span a carry reads on that span's wire, the
+        root's too when top is set. A carry reads its node's lower half, so the upper halves down
+        the right edge are left out."""
+        T = Tape()
+
+        def walk(node, need):
+            if node["kids"] is None:
+                if need and len(node["seg"]) > 1:
+                    pool = list(node["q"][1:])
+                    got = and_tree(T, node["seg"], lambda: pool.pop(0))
+                    assert got == node["a"] and not pool
+                return
+            lo, hi = node["kids"]
+            walk(lo, True)
+            walk(hi, need)
+            if need:
+                T.ccx(lo["a"], hi["a"], node["a"])
+
+        walk(self.root, top)
+        return T
+
+    def write(self, t, mid=None, carries_first=False):
+        """mid(z), when given, runs while z holds AND(~new bits): t * z is the carry out of the
+        bits, t * AND(old bits). It runs before t's last use, or with carries_first after the
+        write's own last use of t, so that a hook that comes late does not hold the carries."""
         C = self.C
         if not self.bits:
             return
@@ -224,17 +298,97 @@ class PrefixTree:
                 C.cx(blk["cin"], x)
         for x in self.bits:
             C.x(x)
-        self.chains.play(C)
-        self.tree.play(C)
+        if LEAN_REBUILD:
+            again = self._rebuild(mid is not None)
+        else:
+            again = Tape()
+            again.ops = self.chains.ops + self.tree.ops
+        again.play(C)
+        if carries_first:
+            carries.play(C, reverse=True)
         if mid is not None:
             mid(self.top)
-        carries.play(C, reverse=True)
-        self.tree.play(C, reverse=True)
-        self.chains.play(C, reverse=True)
+        if not carries_first:
+            carries.play(C, reverse=True)
+        again.play(C, reverse=True)
         for x in self.bits:
             C.x(x)
         C.free(made[::-1])
-        C.free(self.taken[::-1])
+        self._give()
+
+    def _give(self):
+        self.C.free(self.taken[::-1])
+
+
+class PrefixLent(PrefixTree):
+    """PrefixTree with its chains and tree on lent wires in place of clean scratch.
+
+    lend: wires that all hold 1 in every state where the AND of these bits is read or a carry
+    enters them, and that nothing else touches until write is done. Each one taken sits under an X,
+    so in those states it starts clean and holds what PrefixTree's wire would. Everywhere else it
+    holds that XOR a fixed bit, and no gate lets that out: a chain or tree wire is read either
+    beside a carry on a clean wire, which is 1 only in those states, or by a gate that the same
+    gate on the same controls undoes. With no carry in, the bits do not change, so the clears
+    that PrefixTree computes from the new bits are those same gates. The carries stay on clean
+    wires. The caller reads .top only beside a wire that is 1 only when the lent wires are.
+    """
+
+    def __init__(self, C, bits, block, lend):
+        self.lend = list(lend)
+        super().__init__(C, bits, block)
+
+    def _alloc(self):
+        w = self.lend.pop(0)
+        self.C.x(w)
+        self.taken.append(w)
+        return w
+
+    def _give(self):
+        for w in reversed(self.taken):
+            self.C.x(w)
+
+
+class PrefixSplit:
+    """bits += t, and AND(bits) on .top when asked for, on about half a PrefixTree's clean scratch.
+
+    The low half of the bits is a PrefixTree. The high half is a PrefixLent on the low half's own
+    wires: its AND counts and a carry reaches it only when the low half is all ones. write adds to
+    the high half first, with the carry t * AND(low half) on a wire of its own, cleared from the
+    low tree's top before the low half takes t.
+    """
+
+    def __init__(self, C, bits, block=4, top=True):
+        self.C = C
+        bits = list(bits)
+        cut = len(bits) - len(bits) // 2                  # the high half needs one wire a bit, less one
+        self.lo = PrefixTree(C, bits[:cut], block)
+        self.hi = PrefixLent(C, bits[cut:], block, bits[:cut]) if cut < len(bits) else None
+        self.top = None
+        if top and self.hi is None:
+            self.top = self.lo.top
+        elif top:
+            (self.top,) = C.alloc(1)
+            C.ccx(self.lo.top, self.hi.top, self.top)
+
+    def write(self, t):
+        C = self.C
+        if self.hi is None:
+            self.lo.write(t)
+            return
+        if self.top is not None:
+            C.ccx(self.lo.top, self.hi.top, self.top)
+            C.free([self.top])
+        (c,) = C.alloc(1)
+        C.ccx(t, self.lo.top, c)
+        self.hi.write(c)
+        C.ccx(t, self.lo.top, c)
+        C.free([c])
+        self.lo.write(t)
+
+
+# write(aside=True) clears the carries below the quiet run by arith.CarrySweep over carry_trees'
+# (lo, hi, cap, fan, leaf), or None for one fall a bit, 11 ticks each in series.
+LOW_FALL_TREE = (None, 2, 8, 2, 2)
 
 
 class LowAdd:
@@ -278,6 +432,7 @@ class LowAdd:
                 self.up.ccx(K[i - 1], L_[i], K[i])
             self.blocks.append({"lo": lo, "hi": hi, "z": z, "pi": None, "cin": None})
         self.pis, self.join = Tape(), Tape()
+        self.products, self.copies = [], {}
         self.skip = None
         carry = None
         for blk in self.blocks:
@@ -288,6 +443,7 @@ class LowAdd:
                 pi = [L_[lo]]
                 for i in range(lo + 1, hi):
                     t = self._alloc()
+                    self.products.append(t)
                     self.pis.ccx(pi[-1], L_[i], t)
                     pi.append(t)
                 blk["pi"], blk["cin"] = pi, carry
@@ -325,11 +481,16 @@ class LowAdd:
         self.fan.play(C, reverse=True)
         self._free()
 
-    def write(self, quiet_write):
+    def write(self, quiet_write, aside=False, before_falls=None):
         """quiet_write(c, mid) adds the carry wire c into the quiet run, and calls mid(z) once,
         before c's last use, with a wire z for which c * z = c * [the run was all ones]: the old
         mtop before the run changes, or AND(~run) after. The quiet run's write does not wait for
-        the top stretch, whose first fall waits for whoever still reads .top."""
+        the top stretch, whose first fall waits for whoever still reads .top.
+
+        aside: the bits below the quiet run take their sums at once, and their carries fall
+        against copies, so whoever reads L next does not wait for that chain. The caller ends
+        with release(), once L's readers are done. before_falls() runs when L[1:a] hold their sums,
+        ahead of the copies and of everything after them."""
         C, L, K = self.C, self.L, self.K
         # Make each later block's state the single chain's: true inner carries, its products
         # cleared, and its carry-in wire traded for the wire below it.
@@ -340,6 +501,9 @@ class LowAdd:
             for k in range(1, hi - lo):
                 C.ccx(cin, pi[k - 1], K[lo + k - 1])
         self.pis.play(C, reverse=True)
+        if aside:
+            C.free(self.products[::-1])
+            self.taken = [x for x in self.taken if x not in self.products]
         for blk in self.blocks:
             if blk["cin"] is None:
                 continue
@@ -347,7 +511,6 @@ class LowAdd:
                 C.cx(blk["z"], blk["cin"])
             for s in self._on(blk["lo"]):
                 C.cx(s, blk["z"])
-        first = self.blocks[0]
 
         def below(i):
             for blk in self.blocks:
@@ -369,12 +532,62 @@ class LowAdd:
                 fall(i)
             C.ccx(K[self.a - 1], z, self.skip)
 
+        low = range(1, self.a) if aside else ()
+        for i in low:
+            # The rail below bit i holds c_i ^ k_i, so L[i] takes its sum now.
+            C.cx(below(i), L[i])
+            for s in self._on(i):
+                C.cx(s, L[i])
         if self.skip is not None:
             quiet_write(K[self.a - 1], top)
         else:
             for i in reversed(range(self.b, len(L))):
                 fall(i)
-        for i in reversed(range(self.a)):
-            fall(i)
+        if before_falls is not None:
+            before_falls()
+        for i in low:
+            # ~(sum ^ k_i) = ~(l_i ^ c_i): with the rail c_i ^ k_i it gives the same product as
+            # the fall's own pair, (c_i ^ k_i)(l_i ^ k_i).
+            (t,) = C.alloc(1)
+            self.copies[i] = t
+            C.cx(L[i], t)
+            for s in self._on(i):
+                C.cx(s, t)
+            C.x(t)
+        if aside and LOW_FALL_TREE and self.a > 2:
+            # Each fall is K[i] ^= below(i) * P_i and then CXs out of K[i]; the rail below is read
+            # before those CXs reach it, and K[i] is only XORed into in between. So the CCXs are
+            # the carry sweep's inverse on the rails, which runs over trees, and the CXs follow in
+            # the falls' order.
+            from .arith import CarrySweep, carry_trees
+            rails = [below(0)] + [K[i] for i in range(self.a)]
+            P = [L[0]] + [self.copies[i] for i in range(1, self.a)]
+            sweep = CarrySweep(C, rails, P, lambda: C.alloc(1)[0], lambda t: C.free([t]))
+            for root in reversed(carry_trees(self.a, LOW_FALL_TREE)):
+                sweep.backward(root)
+            for i in reversed(range(self.a)):
+                C.cx(K[i], below(i))
+                if i in self.copies:
+                    C.x(self.copies[i])
+                    C.cx(K[i], self.copies[i])
+                else:
+                    C.cx(K[i], L[i])
+        else:
+            for i in reversed(range(self.a)):
+                if i in self.copies:
+                    c, t = below(i), self.copies[i]
+                    C.ccx(c, t, K[i])
+                    C.cx(K[i], c)
+                    C.x(t)
+                    C.cx(K[i], t)
+                else:
+                    fall(i)
         self.fan.play(C, reverse=True)
         self._free()
+
+    def release(self):
+        """Clears the copies write(aside=True) left, each holding its bit of L."""
+        for i, t in self.copies.items():
+            self.C.cx(self.L[i], t)
+        self.C.free(list(self.copies.values())[::-1])
+        self.copies = {}
