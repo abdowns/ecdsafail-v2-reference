@@ -45,7 +45,7 @@ ALLOWED_GATES = {"X", "CX", "CCX", "SWAP"}
 REFERENCE = {"commit": "8ca9b0e", "sample_max_t": 50_465_989, "wires": 2311}
 COVERAGE = {"model_primes": 13, "toy_instances": 36, "toy_lanes": 25_800,
             "components": 52, "component_lanes": 13_867,
-            "sweep_primes": 10, "sweep_mutants": 4,
+            "sweep_primes": 10, "sweep_mutants": 3,  # 4 with SWAP_WIRES on: no-restore is a swap wire's
             "mutation_trials": 200, "mutations_caught_at_least": 163, "secp_special_points": 6}
 G_MULTIPLES = tuple(range(1, 9))
 SECP_RANDOM_POINTS = {True: 8, False: 120}

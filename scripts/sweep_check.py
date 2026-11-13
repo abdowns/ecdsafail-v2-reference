@@ -17,6 +17,9 @@ Each mutant in MUTANTS must then fail `product` at some prime in MUTANT_PRIMES:
   no-restore   the mark on a swap wire turned back without its X;
   no-unsweep   the tape left swept for the inverse Euclid pass.
 
+With SWAP_WIRES off there are no swap wires: `chain` has nothing to run, the body unsweeps with
+`_b1_sweep`, and the mutants are no-ccx, no-toggle and no-unsweep on that path.
+
     python3 -I scripts/sweep_check.py
 """
 import io
@@ -81,6 +84,7 @@ def pass_bad(q, stage):
     if stage == "old":
         m._b1_sweep(G)
     elif stage == "chain":
+        assert swr
         m._sweep_sw(G, swr)
     structural(C.prims, C.num_wires)
     xs = list(range(1, q))
@@ -156,17 +160,29 @@ def _no_unsweep(self, G, swr):
     pass
 
 
+def _no_plain_unsweep(self, G, lo=1, done=None, _real=DialogMultiplier._b1_sweep):
+    # The body's unsweep is the one call with neither argument.
+    if lo == 1 and done is None:
+        return
+    _real(self, G, lo, done)
+
+
 MUTANTS = {
     "no-ccx": (TwoBitMod, "_sweep_in", _no_ccx),
     "no-toggle": (TwoBitMod, "_sweep_in", _no_toggle),
     "no-restore": (TwoBitMod, "_drop_after_b1", _no_restore),
     "no-unsweep": (DialogMultiplier, "_sweep_sw", _no_unsweep),
 }
+PLAIN_MUTANTS = {
+    "no-ccx": MUTANTS["no-ccx"],
+    "no-toggle": MUTANTS["no-toggle"],
+    "no-unsweep": (DialogMultiplier, "_b1_sweep", _no_plain_unsweep),
+}
 
 
 @contextmanager
-def mutant(name):
-    owner, attr, fn = MUTANTS[name]
+def mutant(name, table):
+    owner, attr, fn = table[name]
     saved = getattr(owner, attr)
     setattr(owner, attr, fn)
     try:
@@ -177,7 +193,7 @@ def mutant(name):
 
 def inline(q):
     m = DialogMultiplier(Circuit(), Mod(q))
-    return m.inline_sweep and m.swap_width > 0
+    return m.inline_sweep and (m.swap_width > 0 or not DialogMultiplier.SWAP_WIRES)
 
 
 def main():
@@ -188,12 +204,14 @@ def main():
         covered += 1
         m = DialogMultiplier(Circuit(), Mod(q))
         row = {"q": q, "ticks": m.iters, "rank_cells": m.rank_j, "swap_wires": m.swap_width,
-               "raw_bad": pass_bad(q, None), "old_bad": pass_bad(q, "old"), "chain_bad": pass_bad(q, "chain"),
+               "raw_bad": pass_bad(q, None), "old_bad": pass_bad(q, "old"),
+               "chain_bad": pass_bad(q, "chain") if m.swap_width else 0,
                "forward_bad": product_bad(q, False), "inverse_bad": product_bad(q, True)}
         ok &= not any(v for k, v in row.items() if k.endswith("_bad"))
         print(json.dumps(row), flush=True)
-    for name in MUTANTS:
-        with mutant(name):
+    table = MUTANTS if DialogMultiplier.SWAP_WIRES else PLAIN_MUTANTS
+    for name in table:
+        with mutant(name, table):
             bad = {q: product_bad(q, False) + product_bad(q, True) for q in MUTANT_PRIMES if inline(q)}
         caught = any(bad.values())
         ok &= caught
