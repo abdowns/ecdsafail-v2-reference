@@ -23,9 +23,9 @@ class DialogMultiplier:
     RAW_TAPE = True
     # Chain carries the forward pass leaves as junk for the inverse pass. Each is held through the
     # Bezout pass and saves one CCX in each Euclid pass, so this is the one knob that trades wires
-    # for CCX; 630 puts the circuit at 4,096 wires at n = 256, beside the 369 swap wires, the 325
-    # the pass keeps for the rank-one conversion, and that conversion's own.
-    CARRY_JUNK = 630
+    # for CCX; 779 puts the circuit at 4,096 wires at n = 256, beside the 406 the pass keeps for
+    # the rank-one conversion, and that conversion's own.
+    CARRY_JUNK = 779
     # A junk wire takes two chain bits where the chain has them (_pair_up, _pair_down); False keeps
     # one bit a wire.
     JUNK_PAIRS = True
@@ -41,8 +41,10 @@ class DialogMultiplier:
     # The lazy run ends at the last tick whose word has this many bits above the threshold, and the
     # ticks after it run their word whole; None ends it at LAZY_WINDOW + 1 bits. With a junk wire at
     # 2 CCX a pass and the lazy tick at its present cost, 8 is the least pass (11 was before the window
-    # cell and the short counter step, 9 with a junk wire at 1).
-    LAZY_END = 8
+    # cell and the short counter step, 9 with a junk wire at 1). That is the pass alone. The rank-one
+    # start must stay above the last lazy tick (_rank_j): 8 leaves it 21 cells, 9 leaves 24 and 10
+    # leaves 27, and with the start counted 10 is the least circuit.
+    LAZY_END = 10
     # Lazy ticks run in blocks with a far front: the cells from the front up are one register for
     # U's word and V's, which stays put through the block and lags behind V's shifts; one shift
     # after the block's last tick brings it down by the count. These are the block lengths the
@@ -79,8 +81,8 @@ class DialogMultiplier:
     LAG_MIN_SAVING = 1
     # The Bezout pass's first cells run on unreduced integers, up to this many, then one conversion
     # (rank_one.py); 0 turns it off. From 22 the fold's product no longer splits (rank_one.split),
-    # and 24 is the last start above the Euclid pass's lazy ticks (_rank_j).
-    RANK_J = 24
+    # and 27 is the last start above the Euclid pass's lazy ticks (_rank_j) at LAZY_END 10.
+    RANK_J = 27
     # (first, last): blocks only on these ticks. No real input still has U's word above the front where
     # the default run ends, so the exit swap's gate moves the run's ends to where built inputs do.
     LAG_SPAN = None
@@ -90,8 +92,9 @@ class DialogMultiplier:
     # With the inline sweep, each cell a general Bezout tick reads, but cell 0, has a wire for its
     # swap bit s = g0 AND b, written by one CX in the Euclid step. The tick reads it in place of a
     # CCX, forms its B1 mark on it, and the next tick turns the mark back with X and CX; the unsweep
-    # then costs 1 CCX a cell. 3 CCX a cell and pass for one wire.
-    SWAP_WIRES = True
+    # then costs 1 CCX a cell. 3 CCX a cell and pass for one wire. That paid while a junk wire was
+    # worth 4 CCX. With JUNK_PAIRS it is worth 8, and the same wires save more as chain junk.
+    SWAP_WIRES = False
 
     def __init__(self, C, mod):
         self.C, self.mod = C, mod
