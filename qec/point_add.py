@@ -1,345 +1,100 @@
 """Exact, complete, controlled fixed-addend point addition:
 |c>|R>|0> -> |c>|R + c*A>|0> for every R in E(F_q) encoded as little-endian
 affine (x, y) with infinity = (0, 0)."""
-from .arith import (Mod, _Gates, _add_selected_tree, _doubling, _emit, _maj, add_const, adjacent_xor, cswap,
-                    fan_into, load_const, lookahead_sweep, tree_temps)
-from .builder import Circuit
+import functools
+
+from .arith import Mod, _maj, cswap, load_const
+from .builder import Circuit, flatten
 from .curve import Curve
 from .square import SquareFold
+from .zero_prefix import ZeroPrefix
 from .two_bit import TwoBitMod
-from .model import tick_bound, tick_widths
-from . import block0_code, tail_code, tape_block
+from .model import tick_bound, tick_joint, tick_widths
+from . import block0_code, rank_one, tail_code, tape_block, two_bit
 from .tape_block import FREE, TICKS
-
-
-def _fanout(C, src, copies):
-    have, todo = [src], list(copies)
-    while todo:
-        nxt = []
-        for h in list(have):
-            if not todo:
-                break
-            t = todo.pop(0)
-            C.cx(h, t)
-            nxt.append(t)
-        have += nxt
-
-def _unfanout(C, src, copies):
-    # The doubling tree's CX in reverse order.
-    rec = []
-    have, todo = [src], list(copies)
-    while todo:
-        nxt = []
-        for h in list(have):
-            if not todo:
-                break
-            t = todo.pop(0)
-            rec.append((h, t))
-            nxt.append(t)
-        have += nxt
-    for h, t in reversed(rec):
-        C.cx(h, t)
-
-def _par_rotate(C, two, V, cp):
-    """Rotate V left by one under `two`: reverse V[0..L-1], then reverse V[0..L-2]."""
-    L = len(V)
-    # With fewer clean wires than L // 2 - 1, the copies are shared round-robin; the rotation is
-    # the same permutation, only less parallel.
-    ctl = [two] + cp
-    _fanout(C, two, cp)
-    for p in range(L // 2):
-        cswap(C, ctl[p % len(ctl)], [V[p]], [V[L - 1 - p]])
-    for p in range((L - 1) // 2):
-        cswap(C, ctl[p % len(ctl)], [V[p]], [V[L - 2 - p]])
-    _unfanout(C, two, cp)
-
-
-RCAP = 6
-
-
-def ring_layout(n):
-    """Split n ring wires: h, r copies each of g0 and g1 (every bit's select reads both, and one
-    wire for all bits serializes them), and m >= 2 carry-copy slots."""
-    L = n - 1
-    r = min(RCAP, max(0, (L - 2) // 3))
-    return r, L - 2 * r
-
-def shared_difference_u1(C, U, V, g0, g1, ring):
-    w = len(U)
-    assert w >= 2 and len(ring) >= 3
-    r, m = ring_layout(len(ring))
-    h = ring[0]
-    G0, G1, slots = list(ring[1:1 + r]), list(ring[1 + r:1 + 2 * r]), list(ring[1 + 2 * r:])
-    assert len(slots) == m >= 2
-    (cin,) = C.alloc(1)
-    carries = [cin] + U[:-1]
-    for wire in V:
-        C.x(wire)
-    for c in G0:
-        C.cx(g0, c)
-    for i in range(w):
-        if i == 0:
-            C.cx(U[i], V[i])
-            C.cx(U[i], carries[i])
-            C.cx(V[i], U[i])
-        else:
-            _maj(C, carries[i], V[i], U[i])
-    C.ccx(g0, U[-1], g1)
-    for c in G1:
-        C.cx(g1, c)
-    C.cx(g0, h)
-    C.cx(g1, h)
-    C.x(h)
-    K = {}
-    a0 = lambda i: G0[i % r] if r else g0
-    a1 = lambda i: G1[i % r] if r else g1
-
-    def select(i):
-        u, v, k = U[i], V[i], K[i]
-        C.cx(u, v)
-        C.ccx(a0(i), k, v)
-        C.cx(u, k)
-        C.cx(k, v)
-        C.ccx(a1(i), v, u)
-        C.cx(k, v)
-
-    def finish(i):
-        # unc(i) clears K[i + 1]; then the bit's final values
-        u, v = U[i], V[i]
-        if i + 1 in K:
-            C.cx(a0(i), v)
-            C.cx(u, v)
-            C.ccx(K[i], v, K[i + 1])
-            C.cx(u, v)
-            C.ccx(u, v, K[i + 1])
-            C.cx(h, v)
-            del K[i + 1]
-        else:
-            C.x(v)
-            C.cx(a1(i), v)
-        C.cx(a1(i), u)
-
-    for i in reversed(range(1, w)):
-        K[i] = slots[i % m]
-        C.cx(U[i - 1], K[i])
-        C.ccx(U[i - 1], V[i], U[i])
-        if i != w - 1:
-            C.cx(U[i + 1], U[i])
-            select(i + 1)
-            finish(i + 1)
-    C.cx(U[1], U[0])
-    select(1)
-    finish(1)
-    C.cx(U[0], K[1])
-    del K[1]
-    assert not K
-    # bit 0 as the tree with R
-    C.cx(V[0], U[0])
-    C.cx(g0, V[0])
-    C.cx(carries[0], V[0])
-    C.cx(U[0], carries[0])
-    C.cx(carries[0], V[0])
-    C.free([cin])
-    C.x(V[0])
-    C.x(h)
-    C.cx(g1, h)
-    C.cx(g0, h)
-    for c in G1:
-        C.cx(g1, c)
-    for c in G0:
-        C.cx(g0, c)
-
-
-U6_RING = 193
-# Give a step the bit-level tree's temps when that is more than U6_RING and the pass has them.
-WIDE_RING = True
-# Run the first Euclid step's control fans, constant add and rotation in log depth, on TICK0_SCRATCH
-# wires of unwritten tape.
-TICK0_TREE = True
-TICK0_SCRATCH = 450
-TICK0_COPIES = 31
-# Clean wires a step may take beyond the pass's tape for the bit-level tree's ring. The steps short
-# of a full ring take 42 at most, and the pass runs further than that below the circuit's peak, so
-# they cost no wire.
-RING_BORROW = 300
-
-
-def _ring_size(w, avail):
-    """The clean tape wires a step at width w takes as its ring, from avail."""
-    k = min(max(U6_RING, (w - 1) // 2 - 1), avail)
-    full = tree_temps(w + 1, 1)
-    return full if WIDE_RING and k < full <= avail else k
-
-
-def ring_layout_u6(n):
-    """Copies of g0 and of g1, n // 2 each, and lookahead temps, all n, on the same ring wires at
-    different times. None below 7."""
-    if n < 7:
-        return None
-    return n // 2, n
-
-
-def _fan(C, src, copies):
-    """CX src into each clean copy by doubling: depth about log2(len(copies) + 1)."""
-    have = [src]
-    todo = list(copies)
-    while todo:
-        new = []
-        for s in have:
-            if not todo:
-                break
-            d = todo.pop(0)
-            C.cx(s, d)
-            new.append(d)
-        have += new
-
-
-def _unfan(C, src, copies):
-    g = _Gates()
-    _fan(g, src, copies)
-    _emit(C, reversed(g.ops))
-
-
-def shared_difference_u6(C, U, V, g0, g1, ring):
-    """The step's shared difference with its down-sweep as the up-sweep run backwards.
-    On the step's domain (U odd, so a_0 = 1; g0 = V[0]; g1 = 0), with b' = ~b and s = a + b'
-    mod 2^w, the tree's unwind leaves (a, b) if g0 = 0, (a, ~s) if g0 and not g1, and (~b', s)
-    if g1 = g0 c_w, except V[0] = ~s_0 whatever g1 is. The carries of a + ~s and of b' + ~s equal
-    those of a + b', so after the up-sweep the up-sweep states of (a, ~s) and (b', ~s) are a CX or
-    two a bit away (B_i = ~(p_i ^ k_i); A_(i-1) = k_i ^ p_i and B_i = ~k_i), and the same sweep run
-    backwards leaves them. No carry copies and no uncopy chain. The whole ring is the sweeps'
-    temps, which they leave clean; copies of g0 and g1 sit on it only for the middle step and
-    for the select."""
-    w = len(U)
-    lay = ring_layout_u6(len(ring))
-    assert w >= 2 and lay is not None
-    r, _ = lay
-    G0, G1 = list(ring[:r]), list(ring[r:2 * r])
-    (cin,) = C.alloc(1)
-    for wire in V:
-        C.x(wire)
-    up = _Gates()
-    for i in range(w):
-        up.cx(U[i], V[i])
-    up.cx(U[0], cin)
-    adjacent_xor(up, U)
-    lookahead_sweep(up, [cin] + list(U), [None] + list(V), list(ring))
-    _emit(C, up.ops)
-    _fan(C, g0, G0)
-    C.ccx(g0, U[-1], g1)
-    _fan(C, g1, G1)
-    for i in range(w):
-        k = cin if i == 0 else U[i - 1]
-        C.ccx(G1[i % r], V[i], k)
-        C.ccx(G0[i % r], k, V[i])
-        C.cx(G0[i % r], V[i])
-    _unfan(C, g1, G1)
-    _unfan(C, g0, G0)
-    _emit(C, reversed(up.ops))
-    _fan(C, g0, G0)
-    _fan(C, g1, G1)
-    for i in range(w):
-        C.cx(G1[i % r], U[i])
-        C.x(V[i])
-        C.cx(G0[i % r], V[i])
-        if i:
-            C.cx(G1[i % r], V[i])
-    _unfan(C, g1, G1)
-    _unfan(C, g0, G0)
-    C.free([cin])
-
-
-# Widths at which the step uses the in-place ripple below instead of a ring variant: there it has
-# fewer ticks and fewer CCX than u1 and u6 (measured in isolation, w = 2..12).
-RIPPLE_MAX_W = 12
-
-
-def shared_difference_ripple(C, U, V, g0, g1, ring):
-    """The step's shared difference as one in-place majority chain, from 2elliot depth/v2 (9d34aef);
-    the same map as the chain fallback on every input.
-
-    Up: each MAJ's two CXs run ahead of every CCX (they commute with the CCXs between), so each
-    CCX's first control is the previous CCX's target. Down: the selection moves into (c, v) before
-    the carry arrives, by maps that keep c.~v, which is all the restore and the carry read:
-    v ^= g0.~c, c ^= v while the up chain runs, then v ^= h1.~c with h1 = g1 ^ g0.carry_out.
-    After the restore the tail is linear: u ^= v, v ^= u ^ g0 ^ h1, u ^= g0.h1. k and m copy g0
-    and h1 so that the two selections alternate controls, then hold g0.h1 and g0 ^ h1.
-    cin, k and m are the first clean ring wires, or fresh wires when the ring is shorter; all three
-    end at zero."""
-    w = len(U)
-    lent = list(ring[:3])
-    fresh = C.alloc(3 - len(lent))
-    cin, k, m = lent + fresh
-    carries = [cin] + U[:-1]
-    for wire in V:
-        C.x(wire)
-    C.cx(g0, k)
-    C.cx(U[0], V[0])
-    C.cx(U[0], cin)
-    for i in range(1, w):
-        C.cx(U[i], V[i])
-        C.cx(U[i], carries[i])
-    C.cx(V[0], U[0])
-    for i in range(1, w):
-        C.ccx(carries[i], V[i], U[i])
-        C.x(carries[i])
-        C.ccx(k if (w - 1 - i) % 2 == 0 else g0, carries[i], V[i])
-        C.cx(V[i], carries[i])
-    C.ccx(g0, U[-1], g1)
-    C.cx(g1, m)
-    for i in reversed(range(1, w)):
-        C.ccx(m if (w - 1 - i) % 2 == 0 else g1, carries[i], V[i])
-        C.x(carries[i])
-        C.ccx(carries[i], V[i], U[i])
-    C.cx(g0, k)
-    C.ccx(g0, g1, k)
-    C.cx(g0, m)
-    for i in reversed(range(1, w)):
-        C.cx(U[i], carries[i])
-        C.cx(V[i], U[i])
-        C.cx(U[i], V[i])
-        C.cx(m, V[i])
-        C.cx(k, U[i])
-    C.cx(V[0], U[0])
-    C.cx(g0, V[0])
-    C.cx(U[0], cin)
-    C.cx(U[0], V[0])
-    C.cx(g1, m)
-    C.cx(g0, m)
-    C.ccx(g0, g1, k)
-    C.free(fresh)
-    for wire in V:
-        C.x(wire)
-
-
-# Hand each Bezout tick's B1 mark to the next tick when nothing runs between them.
-HAND_OFF_MARK = True
-
-# Run the Bezout pass's block codec calls on the free wires freed longest ago.
-CODEC_ASIDE = True
-# The Euclid pass's back-to-back block encodes take their clean wires from this many sets in turn.
-ENCODE_SETS = 3
-
-
-def _aside(C, fn):
-    """Run fn on the free wires freed longest ago, and leave the wires it frees under the rest.
-    A codec call between two ticks then takes no wire the tick before it just freed, which it
-    would wait on, and the tick after it takes the codec's wires last."""
-    if not CODEC_ASIDE:
-        return fn()
-    rest = C.free_stack
-    C.free_stack = rest[::-1]
-    out = fn()
-    st = C.free_stack
-    m = 0
-    while m < min(len(st), len(rest)) and st[m] == rest[-1 - m]:
-        m += 1
-    C.free_stack = st[m:] + rest[len(rest) - m:]
-    return out
 
 
 class DialogMultiplier:
     """M(x, y) = (x, x*y mod q) for canonical 1 <= x < q; see model.py."""
+
+    # The tape stays decoded: no block, block-zero or tail code, and so no pebbled ticks. Every
+    # code call below is gated on blocks or tail, and each encode was paired with a decode that
+    # nothing between reads past, so the passes are the same maps on the same states.
+    RAW_TAPE = True
+    # Chain carries the forward pass leaves as junk for the inverse pass. Each is held through the
+    # Bezout pass and saves one CCX in each Euclid pass, so this is the one knob that trades wires
+    # for CCX; 779 puts the circuit at 4,096 wires at n = 256, beside the 406 the pass keeps for
+    # the rank-one conversion, and that conversion's own.
+    CARRY_JUNK = 779
+    # A junk wire takes two chain bits where the chain has them (_pair_up, _pair_down); False keeps
+    # one bit a wire.
+    JUNK_PAIRS = True
+    # A tick whose registers reach this many bits above its joint threshold runs those bits as one
+    # high word, 3 CCX a bit, on a flag that says which register holds it. At n = 256 a word of 2 bits
+    # costs more whole than plain, and 4 or more loses the lazy run, which starts at a word of 3. 3 keeps
+    # the high word in every toy prime of 10 bits or more (2 does from 8).
+    HIGH_MIN = 3
+    # A high word longer than this is lazy: its lowest LAZY_WINDOW bits keep the borrow chain, and
+    # the bits above only move from U to V. One pending borrow wire is enough from 2 up: see
+    # _lazy_plan.
+    LAZY_WINDOW = 2
+    # The lazy run ends at the last tick whose word has this many bits above the threshold, and the
+    # ticks after it run their word whole; None ends it at LAZY_WINDOW + 1 bits. With a junk wire at
+    # 2 CCX a pass and the lazy tick at its present cost, 8 is the least pass (11 was before the window
+    # cell and the short counter step, 9 with a junk wire at 1). That is the pass alone. The rank-one
+    # start must stay above the last lazy tick (_rank_j): 8 leaves it 21 cells, 9 leaves 24 and 10
+    # leaves 27, and with the start counted 10 is the least circuit.
+    LAZY_END = 10
+    # Lazy ticks run in blocks with a far front: the cells from the front up are one register for
+    # U's word and V's, which stays put through the block and lags behind V's shifts; one shift
+    # after the block's last tick brings it down by the count. These are the block lengths the
+    # plan chooses from; () turns it off. A run of blocks is planned where it saves at least
+    # LAG_MIN_SAVING CCX; None plans the first length that fits at every tick, for toy sizes.
+    LAG_BLOCK = (15, 7, 5, 3)
+    # A lag tick that keeps its threshold clears its counted strip after the block's realign, with one
+    # CCX, in place of leaving it as junk; see _lag_clear.
+    LAG_CLEAR = True
+    # A high word's ladder writes its top borrow straight onto g1, a lazy window's onto p.
+    TOP_BORROW_DIRECT = True
+    # The lazy window runs as one cell of 6 CCX, found by search, in place of its ladder's 8; see
+    # _high_word. Gates over the window's wires U0 U1 V0 V1, cw, g0, g1, z, zg and the lazy s and p.
+    LAZY_CELL = True
+    # A lazy tick keeps b * (the bit its second strip brings to the window's top) as its junk wire, in
+    # place of b * p: the wire it counts that bit from is never taken back.
+    STRIP_BIT_JUNK = True
+    # The lazy counter's ladder writes its last carry straight onto the top bit, and a raw tick's
+    # step of two bits takes the carry out of bit 0 as their majority with it; see _count.
+    COUNT_SHORT = True
+    _LAZY_CELL = (
+        "cx cw U0; cx z U0; x U0; x g0; ccx U0 g0 g1; x g0; x U0; cx z U0; cx cw U0; cx U0 U1; cx U0 V0; cx "
+        "U0 V1; cx g0 cw; cx g1 cw; cx z cw; cx zg cw; cx z V0; cx zg V0; ccx cw V0 U0; cx zg V0; cx z V0; cx "
+        "zg cw; cx z cw; cx g1 cw; cx g0 cw; cx U1 V1; cx V1 U0; cx z U0; cx zg U0; cx V1 V0; cx p V0; x V0; "
+        "ccx U0 V0 U1; x V0; cx p V0; cx V1 V0; cx zg U0; cx z U0; cx V1 U0; cx U0 V1; cx V0 U1; cx zg U1; cx "
+        "cw V0; cx g0 V0; cx g1 V0; cx z V0; cx p V0; x V0; ccx U1 V0 U0; x V0; cx p V0; cx z V0; cx g1 V0; "
+        "cx g0 V0; cx cw V0; cx zg U1; cx V0 U1; cx U1 p; cx z V1; cx zg V1; cx s V1; cx p V1; x V1; cx V1 "
+        "U0; cx z U0; cx zg U0; cx p U0; x U0; ccx V1 U0 U1; cx p U0; cx zg U0; cx z U0; cx V1 U0; x V1; cx p "
+        "V1; cx s V1; cx V0 V1; cx V0 g1; cx cw U0; cx cw U1; cx g0 U1; cx z U1; cx zg U1; x U1; ccx U0 U1 "
+        "V0; x U1; cx zg U1; cx z U1; cx g0 U1; cx cw U1; x U0; cx zg g1; cx zg V0; cx z g1; cx z V0; cx z "
+        "U0; cx g1 U0; cx g0 g1; cx g0 V0; cx g0 U0; cx cw g1; cx cw V0; cx V1 g1; cx V1 V0; cx V1 U0; cx g1 "
+        "V1; cx V0 g1; cx V0 V1; cx V0 U0; cx V1 V0; cx U1 p; cx U1 g1; cx g1 U1; cx U0 g1; x V0"
+    )
+    LAG_MIN_SAVING = 1
+    # The Bezout pass's first cells run on unreduced integers, up to this many, then one conversion
+    # (rank_one.py); 0 turns it off. From 22 the fold's product no longer splits (rank_one.split),
+    # and 27 is the last start above the Euclid pass's lazy ticks (_rank_j) at LAZY_END 10.
+    RANK_J = 27
+    # (first, last): blocks only on these ticks. No real input still has U's word above the front where
+    # the default run ends, so the exit swap's gate moves the run's ends to where built inputs do.
+    LAG_SPAN = None
+    # The Euclid pass leaves the tape unswept and the Bezout ticks carry the B1 sweep down it on one
+    # wire, 1 CCX a tick; the tape is unswept again before the inverse pass. Needs a raw tape.
+    INLINE_SWEEP = True
+    # With the inline sweep, each cell a general Bezout tick reads, but cell 0, has a wire for its
+    # swap bit s = g0 AND b, written by one CX in the Euclid step. The tick reads it in place of a
+    # CCX, forms its B1 mark on it, and the next tick turns the mark back with X and CX; the unsweep
+    # then costs 1 CCX a cell. 3 CCX a cell and pass for one wire. That paid while a junk wire was
+    # worth 4 CCX. With JUNK_PAIRS it is worth 8, and the same wires save more as chain junk.
+    SWAP_WIRES = False
 
     def __init__(self, C, mod):
         self.C, self.mod = C, mod
@@ -347,6 +102,7 @@ class DialogMultiplier:
         self.iters = tick_bound(q)
         self.widths = tick_widths(q, self.iters)
         self._euclid_steps = {}
+        self._realigns = {}
         self._euclid_tick0_block = None
         self._encode_block = None
         self._encode_block0 = None
@@ -354,6 +110,9 @@ class DialogMultiplier:
         self._bezout_ticks = {}
         self.narrow = TwoBitMod(q)
         self.block = None
+        self._halves = None
+        self._cutting = False
+        self.carry_junk = self.CARRY_JUNK
 
     @property
     def pass_tail_width(self):
@@ -365,7 +124,7 @@ class DialogMultiplier:
 
     @property
     def blocks(self):
-        return self.iters // TICKS
+        return 0 if self.RAW_TAPE else self.iters // TICKS
 
     @property
     def u_lent(self):
@@ -429,6 +188,20 @@ class DialogMultiplier:
             G[slot] = None
         return wires
 
+    def _block0_places(self, U, pool):
+        """Where a merged pass leaves block 0's free wires: the last of its zero words, which fill
+        U's top u_lent wires and then the pool's first lent_after_pass."""
+        n = self.mod.n
+        places = [(U, i) for i in range(n - self.u_lent, n)] + [(pool, i) for i in range(self.lent_after_pass)]
+        return places[len(places) - len(self._block_free(0, self.swept)):]
+
+    def _code_block0(self, U, pool):
+        """Code block 0 of a pass that left it raw, with its free wires at _block0_places."""
+        G = self.coded_tape(pool)
+        for slot, (reg, i) in zip(self._free_slots(0, self.swept), self._block0_places(U, pool)):
+            G[slot] = reg[i]
+        self._encode(G, 0, self.swept)
+
     def _decode(self, G, j, wires, swept):
         assert len(wires) == len(self._block_free(j, swept))
         for slot, wire in zip(self._free_slots(j, swept), wires):
@@ -436,31 +209,144 @@ class DialogMultiplier:
         self.C.apply(self._encoder(j, swept),
                      [self._block_wires(G, j, swept)], inverse=True)
 
-    def _shared_difference(self, U, V, g0, g1, ring_wires=()):
-        if len(U) <= RIPPLE_MAX_W:
-            shared_difference_ripple(self.C, U, V, g0, g1, list(ring_wires))
-            return
-        if ring_layout_u6(len(ring_wires)) is not None:
-            shared_difference_u6(self.C, U, V, g0, g1, list(ring_wires))
-            return
-        if len(ring_wires) >= 3:
-            shared_difference_u1(self.C, U, V, g0, g1, list(ring_wires[:17]))
-            return
-        """Compare and form the even difference using one majority chain."""
+
+    @staticmethod
+    def _pair_up(C, A0, B0, A1, B1, Cw, J):
+        """Two chain bits on one junk wire, 6 CCX with _pair_down. A0, B0 and A1, B1 hold a, b of
+        the lower and the upper bit, Cw the carry c into the lower, J is 0. Leaves J = c_2, the
+        carry out of the upper bit, A1 = a_1 ^ k and B1 = b_1 ^ k with k = a_0 ^ p,
+        p = (a_0 ^ c)(b_0 ^ c ^ a_1 ^ b_1), and A0, B0, Cw as found. k is the carry c_1 unless
+        a_0 != c and a_1 = b_1, where MAJ(a_1, b_1, .) does not read it."""
+        C.cx(Cw, A0)
+        C.cx(Cw, B0)
+        C.cx(A1, B0)
+        C.cx(B1, B0)
+        C.ccx(A0, B0, J)
+        C.cx(B1, B0)
+        C.cx(A1, B0)
+        C.cx(Cw, B0)
+        C.cx(Cw, A0)
+        C.cx(A0, J)
+        C.cx(J, A1)
+        C.cx(J, B1)
+        C.ccx(A1, B1, J)
+
+    @staticmethod
+    def _pair_down(C, A0, B0, A1, B1, Cw, J, g0, g1):
+        """The descent of _pair_up's two bits, for g1 implies g0: A_i takes a_i ^ g1*(a_i ^ b_i ^ 1)
+        and B_i takes b_i ^ g0*(a_i ^ c_i), as the single bits' descents leave them, Cw keeps c,
+        and J is left holding a function of the step's input for the inverse pass."""
+        e0 = A0
+        C.cx(B0, A1)
+        C.cx(B0, B1)
+        C.cx(Cw, e0)
+        # B0 = b_0 ^ e_0 ^ g0*e_0, e_0 = a_0 ^ c.
+        C.ccx(g0, e0, B0)
+        C.cx(e0, B0)
+        # J ^= (a_1 ^ k ^ g0*e_0)(a_1 ^ b_1 ^ g0), which is (a_1 ^ c_1)(a_1 ^ b_1 ^ g0): c_2 becomes
+        # b_1 ^ g0*(a_1 ^ c_1) ^ a_1 ^ b_1.
+        C.cx(A1, B1)
+        C.cx(B0, A1)
+        C.cx(e0, A1)
+        C.cx(g0, B1)
+        C.ccx(A1, B1, J)
+        C.cx(g0, B1)
+        C.cx(B1, J)
+        C.cx(e0, A1)
+        C.cx(B0, A1)
+        C.cx(A1, B1)
+        C.cx(e0, B0)
+        # B0 is done. A1 ^= (g1 ^ e_0)(g1 ^ a_0 ^ B0 ^ a_1 ^ b_1); B1, which held the second
+        # factor, is the wire the cell leaves as junk.
+        for wire in (A1, B0, e0, Cw, g1):
+            C.cx(wire, B1)
+        C.cx(g1, e0)
+        C.ccx(e0, B1, A1)
+        C.cx(g1, e0)
+        C.cx(Cw, A0)
+        C.cx(B0, A1)
+        C.cx(Cw, A1)
+        C.cx(A0, A1)
+        # A0 ^= g1*(B0 ^ c ^ 1): on g1, B0 ^ c = a_0 ^ b_0.
+        C.cx(Cw, B0)
+        C.ccx(g1, B0, A0)
+        C.cx(g1, A0)
+        C.cx(Cw, B0)
+        C.cx(A0, A1)
+        C.cx(g1, A1)
+        # The upper bit's B sits on J: it goes to B1, and J keeps the junk XOR it.
+        C.cx(B1, J)
+        C.cx(J, B1)
+
+    @staticmethod
+    def _junk_split(m, bits):
+        """(singles, pairs) for m junk wires over a chain's bits 1 .. bits: a pair of bits on one
+        wire costs 6 CCX, a single bit on one wire 3, a bit in place 4. Pairs come first; wires
+        beyond bits // 2 turn pairs back into singles."""
+        assert m <= bits
+        pairs = min(m, bits - m) if DialogMultiplier.JUNK_PAIRS else 0
+        return m - pairs, pairs
+
+    def _shared_difference(self, U, V, g0, g1, top=None, junk=None, high=0, held=None, scratch=None,
+                           lazy=None):
+        """Compare and form the even difference using one majority chain. With top set, bit w - 1
+        is done by _top_bit on the domain that mode names. With junk, the bits from 1 up use those
+        wires and leave them for the inverse pass: first _junk_split's singles, which make their
+        carries c_2 .. on them at 3 CCX a bit, then its pairs, two bits to a wire at 6 CCX.
+        With high, the top `high` bits are done by _high_word."""
         C = self.C
         (cin,) = C.alloc(1)
-        carries = [cin] + U[:-1]
+        chain = len(U) - high if high else len(U) if top is None else len(U) - 1
+        m = len(junk) if junk else 0
+        assert m <= max(chain - 1, 0)
+        singles, pairs = self._junk_split(m, max(chain - 1, 0))
+        m, low = singles, singles + 2 * pairs
+        # carries[i] is the wire with the carry into bit i; a pair's upper bit has none.
+        carries = [cin, U[0]] + list(junk or [])[:m]
+        for k in range(pairs):
+            carries += [None, junk[m + k]]
+        carries += U[low + 1:]
+        lower = {m + 1 + 2 * k: junk[m + k] for k in range(pairs)}
         for wire in V:
             C.x(wire)
-        for i in range(len(U)):
+        for i in range(chain):
             if i == 0:
                 C.cx(U[i], V[i])
                 C.cx(U[i], carries[i])
                 C.cx(V[i], U[i])
-            else:
+            elif i in lower:
+                self._pair_up(C, U[i], V[i], U[i + 1], V[i + 1], carries[i], lower[i])
+            elif m < i <= low:
+                continue
+            elif i > m:
                 _maj(C, carries[i], V[i], U[i])
-        C.ccx(g0, U[-1], g1)
-        for i in reversed(range(len(U))):
+            else:
+                # carries[i + 1] = c ^ (a ^ c)(b ^ c) = MAJ(a, b, c), leaving a ^ c and b ^ c.
+                C.cx(carries[i], U[i])
+                C.cx(carries[i], V[i])
+                C.ccx(U[i], V[i], carries[i + 1])
+                C.cx(carries[i], carries[i + 1])
+        if high:
+            self._high_word(U[chain:], V[chain:], carries[chain], g0, g1, held, scratch, lazy)
+        elif top is None:
+            C.ccx(g0, carries[chain], g1)
+        else:
+            self._top_bit(C, top, g0, U[-1], V[-1], carries[chain], g1)
+        for i in reversed(range(chain)):
+            if i in lower:
+                self._pair_down(C, U[i], V[i], U[i + 1], V[i + 1], carries[i], lower[i], g0, g1)
+                continue
+            if m < i <= low:
+                continue
+            if 1 <= i <= m:
+                # a ^ c and b ^ c: select b ^ g0*(a ^ c); on g1 (so g0) b ^ c ^ (a ^ c) = NOT v ^ a.
+                C.ccx(g0, U[i], V[i])
+                C.x(V[i])
+                C.ccx(g1, V[i], U[i])
+                C.x(V[i])
+                C.cx(carries[i], U[i])
+                C.cx(carries[i], V[i])
+                continue
             # Restore a_i and select S_i while unwinding the carry chain.
             if i == 0:
                 C.cx(V[i], U[i])
@@ -468,93 +354,482 @@ class DialogMultiplier:
             else:
                 C.ccx(carries[i], V[i], U[i])
                 C.ccx(g0, carries[i], V[i])
-            C.cx(carries[i], V[i])
             C.cx(U[i], carries[i])
+            C.cx(U[i], V[i])
+            # S_i XOR c_i XOR 1 is a_i XOR v_i on the swap branch.
+            C.cx(carries[i], V[i])
+            C.x(V[i])
             if i != 0:
                 C.ccx(g1, V[i], U[i])
-                C.cx(g1, U[i])
+            C.x(V[i])
             C.cx(carries[i], V[i])
-            if i != 0:
-                C.cx(g1, V[i])
         C.free([cin])
         for wire in V:
             C.x(wire)
+        for wire in V[1:]:
+            C.cx(g1, wire)
 
-    def _euclid_step(self, w: int, k: int = 0):
-        if k == 0 and w in self._euclid_steps:
-            return self._euclid_steps[w]
-        if (w, k) not in self._euclid_steps:
+    def _high_word(self, U, V, cw, g0, g1, held, scratch, lazy=None):
+        """The chain's bits above the tick's joint threshold, where U or V is zero. held is
+        (z, zg): z is 1 when U is the nonzero one and may be either when both are zero, zg = g0*z.
+        On entry V holds NOT v and cw the carry c into these bits; g1 is 0. The word X = U ^ V is
+        the one that is there. A subtract leaves U = 0 and V = X - e, e = g0*(c ^ z) the borrow
+        of the larger minus the smaller, and swaps exactly when z or the borrow leaves the top:
+        with z the carries are NOT of the borrows and g1 = g0; without, they are the borrows and
+        the top one is g1. scratch holds e and the borrows, and goes back clean.
+        With lazy = (s, p) these bits are only the window of a longer word, and s says the word
+        has nothing above them. Then the window's top borrow is the word's when s is set, and
+        otherwise stays pending on p, the bits above being left as they are."""
+        C = self.C
+        z, zg = held
+        if lazy and self.LAZY_CELL:
+            # The same map on the window's domain: U or V is 0 there, z is 1 beside a word of U's
+            # and 0 beside one of V's, p s = 0, and a pending p finds z = 0 and V's two bits set.
+            assert len(U) == 2 and len(V) == 2
+            wires = dict(U0=U[0], U1=U[1], V0=V[0], V1=V[1], cw=cw, g0=g0, g1=g1, z=z, zg=zg, s=lazy[0], p=lazy[1])
+            for gate in self._LAZY_CELL.split(";"):
+                kind, *names = gate.split()
+                getattr(C, kind)(*(wires[name] for name in names))
+            return
+        E = scratch[:len(U) + 1]
+        for u, v in zip(U, V):
+            C.cx(u, v)
+            C.x(v)
+        for u, v in zip(U, V):
+            C.ccx(zg, v, u)
+        C.cx(z, cw)
+        C.ccx(g0, cw, E[0])
+        C.cx(z, cw)
+        # The ladder's last step writes the top borrow E straight onto its target, and there is
+        # nothing to take back: g1 for a whole word, p for a lazy window.
+        direct = len(V) - 1 if self.TOP_BORROW_DIRECT else None
+        for i, v in enumerate(V):
+            C.x(v)
+            C.ccx(E[i], v, (lazy[1] if lazy else g1) if i == direct else E[i + 1])
+            C.x(v)
+        C.cx(zg, g1)
+        if lazy:
+            # g1 ^ zg becomes the top borrow E s, and p takes the rest of E: E ^ E s.
+            s, p = lazy
+            if direct is None:
+                C.ccx(E[-1], s, g1)
+                C.cx(E[-1], p)
+            else:
+                # p holds p ^ E here. A pending p means the word has a bit above the window, so
+                # p s = 0 on entry and (p ^ E) s = E s.
+                C.ccx(p, s, g1)
+            C.cx(g1, p)
+            C.cx(zg, p)
+        elif direct is None:
+            C.cx(E[-1], g1)
+        for i, v in reversed(list(enumerate(V))):
+            if i != direct:
+                C.x(v)
+                C.ccx(E[i], v, E[i + 1])
+                C.x(v)
+            C.cx(E[i], v)
+        C.cx(z, cw)
+        C.ccx(g0, cw, E[0])
+        C.cx(z, cw)
+        for u, v in zip(U, V):
+            # Off g0 U is as found, and V takes v back. The caller's last X and CX from g1 then
+            # leave X ^ borrow ^ top borrow, g1 ^ zg being the top borrow.
+            C.cx(u, v)
+            C.x(v)
+            C.cx(zg, v)
+
+    def _count(self, ctl, reg, scratch, down=False, twice=None, also=None):
+        """reg += ctl, or reg -= ctl with down, on a two's complement register, low bit first.
+        With twice the step is ctl + 2 * twice, for a twice that is never set beside ctl: it and
+        the carry out of bit 0 are then never both set, and their XOR is the carry into bit 1.
+        With also, a second bit, the step is ctl + also: the carry into bit 1 is the majority of
+        ctl, also and reg[0], ctl ^ (ctl ^ also)(ctl ^ reg[0]), one CCX.
+        With COUNT_SHORT the last carry, the one into the top bit, is written straight onto that
+        bit: it is read nowhere else, so it needs no wire of its own and is not taken back."""
+        C = self.C
+        n = len(reg)
+        assert (twice is None and also is None) or n >= 2
+        if down:
+            for r in reg:
+                C.x(r)
+        a = [ctl] + list(scratch[:n - 1])
+
+        def carry(i, target):
+            # target ^= the carry out of bit i. reg[i] and the carries below it are as found.
+            if i == 0 and also is not None:
+                C.cx(ctl, target)
+                C.cx(ctl, also)
+                C.cx(ctl, reg[0])
+                C.ccx(also, reg[0], target)
+                C.cx(ctl, reg[0])
+                C.cx(ctl, also)
+                return
+            C.ccx(a[i], reg[i], target)
+            if i == 0 and twice is not None:
+                C.cx(twice, target)
+
+        direct = n - 2 if self.COUNT_SHORT and n >= 2 else None
+        for i in range(n - 1):
+            carry(i, reg[i + 1] if i == direct else a[i + 1])
+        for i in range(n - 1, 0, -1):
+            if i - 1 == direct:
+                continue
+            C.cx(a[i], reg[i])
+            carry(i - 1, a[i])
+        C.cx(ctl, reg[0])
+        if also is not None:
+            C.cx(also, reg[0])
+        if down:
+            for r in reg:
+                C.x(r)
+
+    def _or_into(self, bits, target, scratch):
+        """target ^= OR of bits, through scratch wires that go back clean."""
+        C = self.C
+
+        def gate(a, b, t):
+            C.x(a)
+            C.x(b)
+            C.ccx(a, b, t)
+            C.x(a)
+            C.x(b)
+            C.x(t)
+
+        if len(bits) == 1:
+            C.cx(bits[0], target)
+            return
+        dst = list(scratch[:len(bits) - 2]) + [target]
+        steps = [(bits[0] if j == 0 else dst[j - 1], bits[j + 1], dst[j]) for j in range(len(bits) - 1)]
+        for a, b, t in steps:
+            gate(a, b, t)
+        for a, b, t in reversed(steps[:-1]):
+            gate(a, b, t)
+
+    @staticmethod
+    def _top_bit(C, mode, g0, A, B, Cw, H):
+        """Bit w - 1 of the shared difference in place of its MAJ, g1 and unwind (5 CCX). On entry
+        A = U[w-1] holds a, B = V[w-1] holds b = NOT vhat_top, Cw = U[w-2] holds the carry c into
+        bit w - 1, H = g1 is 0. On exit A = U'_top, B = b ^ g0*(a ^ c), Cw = c, H = g0*MAJ(a, b, c),
+        as the five CCX leave them, on the domain the mode names:
+        top_clear: b = 1 (V's top wire is 0 on entry), so g1 = g0*(a | c) and U'_top = a & ~g0.
+        narrow: the step leaves U's top wire 0, so a implies g0 & b, g1 = a ^ g0*c*(a ^ b) and
+            B = a ^ b ^ g0*c.
+        both: both hold."""
+        if mode == "top_clear":
+            C.cx(Cw, A)
+            C.ccx(g0, A, B)
+            C.cx(Cw, A)
+            C.ccx(g0, A, H)
+            C.cx(H, A)
+            C.x(B)
+            C.ccx(Cw, B, H)
+            C.x(B)
+        elif mode == "narrow":
+            C.ccx(g0, Cw, H)
+            C.cx(A, B)
+            C.ccx(H, B, A)
+            C.cx(H, B)
+            C.ccx(g0, Cw, H)
+            C.cx(A, H)
+            C.cx(H, A)
+        elif mode == "both":
+            # P1 = ~a & ~c on B, P2 = ~g0 & ~c on A; then g1 = g0 ^ P1 ^ P2, B = a ^ g0 ^ c ^ P2.
+            C.x(B)
+            C.x(A)
+            C.x(Cw)
+            C.ccx(A, Cw, B)
+            C.x(A)
+            C.x(Cw)
+            C.cx(A, B)
+            C.x(g0)
+            C.x(Cw)
+            C.ccx(g0, Cw, A)
+            C.x(g0)
+            C.x(Cw)
+            C.cx(A, H)
+            C.cx(B, H)
+            C.cx(g0, H)
+            C.cx(H, B)
+            C.cx(Cw, B)
+            C.cx(B, A)
+            C.cx(g0, A)
+            C.cx(Cw, A)
+        else:
+            raise ValueError(mode)
+
+    @staticmethod
+    def _carry_junk(w, top_clear, narrow, kappa=None):
+        """The most carry wires a step at width w can leave: c_2 .. c_chain."""
+        if kappa is not None:
+            return max(kappa - 1, 0)
+        top = w >= 2 and (top_clear or narrow)
+        return max(w - (1 if top else 0) - 1, 0)
+
+    def _euclid_step(self, w: int, top_clear: bool = False, narrow: bool = False, last: bool = False,
+                     carry: int = 0, kappa=None, high: bool = False, fmode=None, init: bool = False,
+                     lazy=None, far=None, on_sw: bool = False):
+        """top_clear: the tick before ran at the same width, so V is below 2^(w - 1) on entry
+        and the second strip's last swap, of two zero bits, never fires.
+        narrow: the next width is w - 1, so by E7 this step leaves U below 2^(w - 1).
+        last: the pass's last tick, whose input reaches (U, V, E) = (1, 0, 0) by E3.
+        carry: the chain's lowest carries, this many, stay on junk wires ahead of the old offset's.
+        kappa: the tick's flag threshold, at or above its joint threshold: U and V are never both
+            2^kappa or more, and a subtract leaves U below it. The flag is [U >= 2^kappa].
+        high: bits kappa and up run as one high word.
+        fmode: how the flag goes on to the next tick. same: the next threshold is kappa, the flag
+            wire takes flag AND NOT g0 and g0*flag stays as junk. drop: the next threshold is
+            kappa - 1, a fresh wire takes that OR U'[kappa - 1] and the old flag stays as junk.
+            final: no tick after this reads it.
+        init: the flag is made here, from U.
+        lazy: (raw, m_in, m_out, leave) for a high word longer than LAZY_WINDOW; see _lazy_plan.
+            V then has one more wire on top, and lz holds the pending borrow p and the counter.
+        far: (front, c, e, size) for tick e of a lag block of c; see _lag_plan. V then has the
+            block's size wires, of which the step relabels only those under the front; the second
+            strip and the move of U's word stop under the front; and a junk wire takes
+            x = two AND NOT flag, which _realign counts.
+        on_sw: a last one-wire register takes the cell's swap bit g0 AND b."""
+        if last:
+            top_clear = narrow = False
+            carry = 0
+            assert not on_sw
+        assert not far or (lazy and not init and not lazy[3] and fmode in ("same", "drop") and far[0] <= w)
+        key = (w, top_clear, narrow, last, carry, kappa, high, fmode, init, lazy, far, on_sw)
+        if key not in self._euclid_steps:
             C = self.C
 
-            def step(U, V, E, cell, cp=()):
+            def step(U, V, E, cell, junk, flag, slot, scratch, lz, lzj, swap):
                 g0, b = cell
+                if lazy:
+                    raw, m_in, m_out, leave = lazy
+                    cut = kappa + self.LAZY_WINDOW
+                    cnt = lz[1:]
+                    spare = lzj[-1] if self.STRIP_BIT_JUNK else scratch[len(cnt) - 1]
                 offset = E[0]
+                if last:
+                    # The input is (1, 0, 0), (1, 1, 0) or (1, 0, 1), and the swept cell is
+                    # (V0 ^ E, NOT g0): V[0] = g0 ^ E is cleared and E is left as the pass's junk.
+                    C.cx(V[0], g0)
+                    C.cx(offset, g0)
+                    C.cx(g0, b)
+                    C.x(b)
+                    C.cx(g0, V[0])
+                    C.cx(offset, V[0])
+                    V[:] = V[1:] + V[:1]
+                    return
+                top = None
+                if w >= 2 and (top_clear or narrow):
+                    top = "both" if top_clear and narrow else "top_clear" if top_clear else "narrow"
                 C.cx(offset, V[0])
                 C.cx(V[0], g0)
-                self._shared_difference(U[:w], V[:w], g0, b, list(cp))
-                V[:] = V[1:] + V[:1]
-                # A no-subtract tick strips a second bit when V + E is even.
-                (two,) = C.alloc(1)
-                C.cx(offset, V[0])
+                # A no-subtract tick strips a second bit when V + E is even. The chain leaves U and
+                # V as found when g0 = 0, so the strip runs first, on V[1:], and two goes straight
+                # onto b, which a subtract leaves 0 until the chain writes g1.
+                low = V[1] if w >= 2 else V[0]
+                C.cx(offset, low)
                 C.x(g0)
-                C.x(V[0])
-                C.ccx(g0, V[0], two)
-                C.x(V[0])
+                C.x(low)
+                C.ccx(g0, low, b)
+                C.x(low)
                 C.x(g0)
-                C.cx(offset, V[0])
-                C.cx(two, b)
-                C.ccx(two, offset, V[0])
-                # A subtract keeps its swap on E and moves the old offset to the cell. It follows
-                # the gates above so that `two` does not wait for it: on g0 they do nothing (two
-                # is 0 and the two CXs from offset cancel), and off g0 the swap does nothing.
-                cswap(C, g0, [offset], [b])
-                if cp:
-                    _par_rotate(C, two, V[:w - 1], list(cp))
+                C.cx(offset, low)
+                if lazy:
+                    # rho = pi - 1 on max(m_in, m_out) bits, pi the ones of U's and V's bits from
+                    # cut up. A bit that the tick before brought to the window's top leaves the
+                    # count and takes the pending borrow; a threshold that dropped brings U[cut].
+                    if m_in == 0:
+                        for r in cnt:
+                            C.x(r)
+                    for r in cnt[m_in:] if m_in else []:
+                        C.cx(cnt[m_in - 1], r)
+                    # The second strip takes V[cut] out of the count as well: spare = b * V[cut].
+                    C.ccx(b, V[cut], spare)
+                    if raw:
+                        bit, new, both = V[cut - 1], lzj[0], scratch[len(cnt)]
+                        if self.COUNT_SHORT:
+                            self._count(bit, cnt, scratch, down=True, also=spare)
+                        else:
+                            C.ccx(bit, spare, both)
+                            C.cx(bit, spare)
+                            self._count(spare, cnt, scratch, down=True, twice=both)
+                            C.cx(bit, spare)
+                            C.ccx(bit, spare, both)
+                        C.x(bit)
+                        C.ccx(lz[0], bit, new)
+                        C.x(bit)
+                        C.cx(lz[0], bit)
+                        lz[0], lzj[0] = new, lz[0]
+                    else:
+                        # U[cut] set means U holds the word and V[cut] is 0, so the step is one
+                        # up or one down: down is up between two flips of the counter.
+                        for r in cnt:
+                            C.cx(spare, r)
+                        C.cx(U[cut], spare)
+                        self._count(spare, cnt, scratch)
+                        C.cx(U[cut], spare)
+                        for r in cnt:
+                            C.cx(spare, r)
+                if w >= 2:
+                    C.ccx(b, offset, V[1])
+                # A lazy V is below 2^(w + 1), or 2^w with top_clear: one more bit than the true one.
+                # In a lag block the strip leaves the far cells where they are: V[1], which is 0 on
+                # b, goes to the cell under the front, a hole. Off the flag every cell the strip
+                # moves lies in V's word; on it V is below 2^kappa and the cells it moves are 0.
+                for i in range(1, far[0] - 1 if far else w - 2 + bool(lazy) if top_clear else w - 1 + bool(lazy)):
+                    cswap(C, b, [V[i]], [V[i + 1]])
+                if far:
+                    C.x(flag[0])
+                    C.ccx(b, flag[0], lzj[-2])
+                    C.x(flag[0])
+                if lazy:
+                    # The second strip brought one more bit to the window's top, and the pending
+                    # borrow, now one place lower, moves back up through it.
+                    bit, t = V[cut - 1], lzj[-1]
+                    if self.STRIP_BIT_JUNK:
+                        # spare = b r, r the bit the strip brought here, stays on the junk wire. The bit
+                        # takes b p, and p loses p r = b r AND NOT (r ^ p), read off the new bit.
+                        C.ccx(b, lz[0], bit)
+                        C.x(bit)
+                        C.ccx(spare, bit, lz[0])
+                        C.x(bit)
+                    else:
+                        C.ccx(b, bit, spare)
+                        C.ccx(b, lz[0], t)
+                        C.cx(t, bit)
+                        C.x(bit)
+                        C.ccx(t, bit, lz[0])
+                        C.x(bit)
+                    for r in cnt[m_out:]:
+                        C.cx(cnt[m_out - 1], r)
+                # g1 lands on the junk wire, then goes to b, where the swept tape wants a subtract's
+                # own swap; the old offset moves onto the junk wire and E takes g1.
+                (g1,) = junk[-1:]
+                zg = None
+                if init:
+                    self._or_into(U[kappa:w], flag[0], scratch)
+                if fmode:
+                    zg = slot[0] if fmode == "same" else scratch[-1]
+                    C.ccx(g0, flag[0], zg)
+                if lazy:
+                    # pi = 0 is rho's sign. Above the window the word only moves from U to V.
+                    self._shared_difference(U[:cut], V[:cut], g0, g1, None, junk[:-1], self.LAZY_WINDOW,
+                                            (flag[0], zg), scratch, (cnt[m_out - 1], lz[0]))
+                    # In a lag block the far cells hold the word of whichever register has one, so
+                    # only the cells under the front change sides.
+                    cswap(C, zg, U[cut:far[0] if far else w], V[cut:far[0] if far else w])
+                elif high:
+                    self._shared_difference(U[:w], V[:w], g0, g1, None, junk[:-1], w - kappa,
+                                            (flag[0], zg), scratch)
                 else:
-                    for i in range(w - 2):
-                        cswap(C, two, [V[i]], [V[i + 1]])
-                C.x(g0)
-                C.ccx(g0, b, two)
-                C.x(g0)
-                C.free([two])
+                    self._shared_difference(U[:w], V[:w], g0, g1, top, junk[:-1])
+                C.cx(g1, b)
+                if on_sw:
+                    # g1 is the swap on a subtract and 0 elsewhere.
+                    C.cx(g1, swap[0])
+                cswap(C, g0, [offset], [g1])
+                if fmode == "same":
+                    C.cx(zg, flag[0])
+                elif fmode == "drop":
+                    new, bit = slot[0], U[kappa - 1]
+                    C.cx(flag[0], zg)
+                    C.cx(bit, new)
+                    C.x(bit)
+                    C.ccx(zg, bit, new)
+                    C.x(bit)
+                    C.cx(flag[0], zg)
+                    C.ccx(g0, flag[0], zg)
+                    flag[0], slot[0] = new, flag[0]
+                elif fmode == "final":
+                    C.ccx(g0, flag[0], zg)
+                if lazy and leave and w - kappa > self.LAZY_WINDOW + 1:
+                    # The ticks after this one run the word whole, so V takes the pending borrow,
+                    # V[cut:] -= p, its borrows on scratch. The counter stays as junk.
+                    cells = V[cut:w + 1]
+                    a = [lz[0]] + list(scratch[:len(cells) - 2])
+                    C.cx(a[0], cells[0])
+                    for j in range(1, len(cells) - 1):
+                        C.ccx(a[j - 1], cells[j - 1], a[j])
+                        C.cx(a[j], cells[j])
+                    C.ccx(a[-1], cells[-2], cells[-1])
+                    for j in range(len(cells) - 2, 0, -1):
+                        C.ccx(a[j - 1], cells[j - 1], a[j])
+                elif lazy and leave:
+                    # The next tick's V fits w - 1 bits. The last bit above the window takes the
+                    # pending borrow, and V's extra wire, which held what p left there, p AND NOT
+                    # bit, is cleared against it. The counter goes to 0 and p's wire stays as junk.
+                    live = cnt[:m_out]
+                    self._count(V[cut], live, scratch, down=True)
+                    self._count(V[w], live, scratch, down=True)
+                    for r in live:
+                        C.x(r)
+                    C.cx(lz[0], V[cut])
+                    C.ccx(lz[0], V[cut], V[w])
+                # The far cells stay: the 0 that leaves V's low end comes back in under the front.
+                V[:] = V[1:far[0]] + V[:1] + V[far[0]:] if far else V[1:] + V[:1]
 
-            if k:
-                self._euclid_steps[w, k] = C.record_shape(step, [w, w, 1, 2, k])
-            else:
-                self._euclid_steps[w] = C.record_shape(step, [w, w, 1, 2])
-        return self._euclid_steps[w] if k == 0 else self._euclid_steps[w, k]
+            sizes = [w, far[3] if far else w + bool(lazy), 1, 2, 0 if last else 1 + carry, 1 if fmode else 0,
+                     1 if fmode in ("same", "drop") else 0, self._step_scratch(key),
+                     1 + max(lazy[1:3]) if lazy else 0, lazy[0] + 1 + bool(far) if lazy else 0, int(on_sw)]
+            self._euclid_steps[key] = C.record_shape(step, sizes)
+        return self._euclid_steps[key]
+
+    @staticmethod
+    def _step_scratch(key):
+        """Clean wires a step borrows: the high word's borrows, and g0*flag unless it stays."""
+        w, kappa, high, fmode, init, lazy = key[0], key[5], key[6], key[7], key[8], key[9]
+        word = w - kappa + 1 if high else 0
+        if lazy:
+            word = max(DialogMultiplier.LAZY_WINDOW + 1, max(lazy[1:3]) + lazy[0], w - kappa - 2 if init else 0,
+                       w - kappa - 3 if lazy[3] else 0)
+        return word + (1 if fmode in ("drop", "final") else 0)
 
     def _euclid_tick0(self):
-        """First Euclid step on U=q, E=0, using unwritten tape for carries."""
+        """First Euclid step on U = q, E = 0. U is clean once q's bits flip, so it holds the add's
+        carries, which then become the select's x without being cleared."""
         if self._euclid_tick0_block is None:
             C, q, n = self.C, self.mod.q, self.mod.n
             f1 = (1 << n) - q + 1
-            k = self._tick0_scratch()
+            j = (f1 & -f1).bit_length() - 1
 
-            def step(U, V, E, cell, scr):
-                C.free(scr)
+            def step(U, V, E, cell):
                 g0, b = cell
                 C.cx(V[0], g0)
-                cps = C.alloc(TICK0_COPIES) if TICK0_TREE else []
-                fan = _Gates()
-                _doubling(fan, g0, cps)
-                _emit(C, fan.ops)
-                src = [g0] + cps
+                for i in range(n):
+                    if q >> i & 1:
+                        C.x(U[i])
+                # U[i] = g0*c_i, c_i the carry into bit i of x + f1; f1 has no bit below j.
+                for i in range(j, n - 1):
+                    if i == j:
+                        C.ccx(g0, V[i], U[i + 1])
+                    elif f1 >> i & 1:
+                        # x_i OR c_i under g0 is d ^ x_i*(g0 ^ d), d = g0*c_i.
+                        C.cx(U[i], U[i + 1])
+                        C.cx(g0, U[i])
+                        C.ccx(U[i], V[i], U[i + 1])
+                        C.cx(g0, U[i])
+                    else:
+                        C.ccx(U[i], V[i], U[i + 1])
+                for i in range(j, n):
+                    if i > j:
+                        C.cx(U[i], V[i])
+                    if f1 >> i & 1:
+                        C.cx(g0, V[i])
+                # V = x ^ g0*(f1 ^ c) now, so U ^= V ^ g0*f1 leaves U = x on every lane.
+                for i in range(n):
+                    C.cx(V[i], U[i])
+                    if f1 >> i & 1:
+                        C.cx(g0, U[i])
+                # Off g0, V still holds x, and U takes q back: U ^= NOT g0 * (x ^ q). Bit 0 of x is g0.
+                C.x(g0)
+                C.cx(g0, U[0])
                 for i in range(1, n):
                     if q >> i & 1:
                         C.x(V[i])
-                    C.ccx(src[i % len(src)], V[i], U[i])
+                    C.ccx(g0, V[i], U[i])
                     if q >> i & 1:
                         C.x(V[i])
-                _emit(C, reversed(fan.ops))
-                if TICK0_TREE:
-                    _add_selected_tree(C, V, [g0], [f1], max_temps=TICK0_SCRATCH - n - TICK0_COPIES - 1)
-                    fan_into(C, g0, V, cps)
-                else:
-                    add_const(C, V, f1, ctrl=g0)
-                    for wire in V:
-                        C.cx(g0, wire)
-                C.free(cps)
+                C.x(g0)
+                for wire in V:
+                    C.cx(g0, wire)
                 C.cx(g0, E[0])
                 V[:] = V[1:] + V[:1]
                 C.x(g0)
@@ -562,104 +837,667 @@ class DialogMultiplier:
                 C.ccx(g0, V[0], b)
                 C.x(V[0])
                 C.x(g0)
-                if TICK0_TREE:
-                    cp = C.alloc((n - 1) // 2 - 1)
-                    _par_rotate(C, b, V[:n - 1], cp)
-                    C.free(cp)
-                else:
-                    for i in range(n - 2):
-                        cswap(C, b, [V[i]], [V[i + 1]])
+                for i in range(n - 2):
+                    cswap(C, b, [V[i]], [V[i + 1]])
+                # A subtract on U = q > x always swaps, and the swept cell keeps that swap.
+                C.cx(g0, b)
 
-            self._euclid_tick0_block = C.record_shape(step, [n, n, 1, 2, k])
+            self._euclid_tick0_block = C.record_shape(step, [n, n, 1, 2])
         return self._euclid_tick0_block
 
-    def _tick0_scratch(self):
-        """The unwritten tape the first step takes: its constant add's carries, or with TICK0_TREE
-        the trees' wires."""
-        n = self.mod.n
-        f1 = (1 << n) - self.mod.q + 1
-        return TICK0_SCRATCH if TICK0_TREE else n - 1 - ((f1 & -f1).bit_length() - 1)
+    @property
+    def tick0_fits(self):
+        """Whether tick 0 runs as _euclid_tick0, which needs no scratch."""
+        if self.widths[0] != self.mod.n:
+            return False
+        tick0 = self._euclid_tick0()
+        return tick0.wires <= set(tick0.flat_in) and set(tick0.flat_out) == set(tick0.flat_in)
 
-    def _euclid_pass(self, U: list[int], pool: list[int]) -> None:
+    def _clean_counts(self):
+        """Per tick, the clean tape and vacated wires left once the tick has its cell."""
+        n, T, W = self.mod.n, self.iters, self.widths
+        clean, out = self.tape_external, []
+        for i in range(T):
+            clean -= 2
+            out.append(clean)
+            nxt = W[i + 1] if i + 1 < T else self.pass_tail_width
+            clean += W[i] - nxt + sum(1 for j in range(nxt, W[i]) if j >= n - self.u_lent)
+        return out
+
+    def _tick_plan(self):
+        """Per tick, None for tick 0 on U = q, else its step's key (w, top_clear, narrow, last,
+        carry, kappa, high, fmode, init, lazy, far). The latest ticks keep their chain carries as junk while
+        carry_junk wires last, the earliest of them perhaps only its lowest ones. A tick with
+        HIGH_MIN or more bits above its joint threshold, and the clean wires to borrow, runs them
+        as a high word; the flag is made at the first such tick and kept up to the last."""
+        T, W = self.iters, self.widths
+        joint, clean = tick_joint(self.mod.q, T), self._clean_counts()
+        plan = []
+        for i in range(T):
+            w = W[i]
+            if i == 0 and self.tick0_fits:
+                plan.append(None)
+                continue
+            # A tick leaves V below 2^(w' - 1), w' its own width.
+            top_clear = i >= 1 and w >= 3 and W[i - 1] == w
+            # E7: the next tick's U fits its width. E3: the last tick ends at (1, 0, 0).
+            last = i == T - 1
+            narrow = not last and W[i + 1] == w - 1
+            kappa = min(w, joint[i])
+            high = not last and kappa >= 1 and w - kappa >= self.HIGH_MIN and w - kappa + 2 <= clean[i]
+            plan.append([w, top_clear, narrow, last, 0, kappa, high, None, False, None, None])
+        flagged = [i for i, key in enumerate(plan) if key and key[6]]
+        if flagged:
+            first, final = flagged[0], flagged[-1]
+            plan[first][8] = True
+            for i in range(first, final + 1):
+                step = plan[i][5] - plan[i + 1][5] if i < final else None
+                assert step in (None, 0, 1) and clean[i] >= 1
+                plan[i][7] = "final" if i == final else "drop" if step else "same"
+        self._lazy_plan(plan)
+        self._lag_plan(plan)
+        for i, key in enumerate(plan):
+            if key and not key[7]:
+                key[5] = None
+        # Wires go to pairs first, from the last tick back, each saving 2 CCX; what is left then
+        # goes to the bits no pair took, 1 CCX a wire.
+        budget = self.carry_junk
+        for share in (2, 1) if self.JUNK_PAIRS else (1,):
+            for key in reversed(plan):
+                if key is None or key[3] or not budget:
+                    continue
+                bits = self._carry_junk(key[0], key[1], key[2], key[5] if key[6] else None)
+                more = min(budget, bits // 2 - key[4] if share == 2 else bits - 2 * key[4] if key[4] == bits // 2 else 0)
+                more = max(more, 0)
+                key[4] += more
+                budget -= more
+        return [None if key is None else tuple(key) for key in plan]
+
+    def _lazy_plan(self, plan):
+        """Mark the lazy ticks: the high ticks with more than LAZY_WINDOW bits above the threshold.
+        There V's physical word is the true one plus p * 2^cut, cut = kappa + LAZY_WINDOW, p the
+        one pending borrow, so V has one more wire. A raw tick finds p one place lower, at
+        2^(cut - 1), and the count taken over V from cut - 1 up, until its first crossing puts both
+        right. Each gets (raw, m_in, m_out, leave):
+        raw: the tick before kept its threshold, so the bit it brought to cut - 1 has not met p.
+        m_in, m_out: the counter's width before and after. It holds rho = pi - 1, pi the ones of
+            U and V from cut up, which number at most w - kappa - LAZY_WINDOW + 1.
+        leave: the run's last tick.
+        One p is enough because the window is all ones under a pending p at every subtract,
+        which comes after the tick's crossing bits have met p. This holds along a run from the
+        borrow that set p, not for an arbitrary p. A borrow leaves
+        the window only when it is 0, and leaves it all ones over a low zone 2^kappa - d with
+        d <= u + 2. Then v >= 3 * 2^kappa, so u < 2^kappa / 9 by the tick's potential bound, the
+        low zone stays above u, and no subtract borrows from the window; each shift halves d,
+        each subtract takes it to (d + u) / 2, and a bit that comes to the window's top under p
+        is a 1 or clears p. The run starts where the word first has LAZY_WINDOW + 1 bits, after
+        a drop at the same width, so the one bit above the window is new and V's is 0. It ends
+        at that length before a narrower tick with the same threshold, where the last tick clears
+        the counter and V's extra wire and leaves p's wire as junk; the plan is left alone
+        otherwise."""
+        R, W = self.LAZY_WINDOW, self.widths
+        lazy = [i for i, key in enumerate(plan) if key and key[6] and key[0] - key[5] > R]
+        if not lazy:
+            return
+        first, final = lazy[0], lazy[-1]
+        if lazy != list(range(first, final + 1)) or plan[first - 1] is None or final + 1 >= len(plan):
+            return
+        before, after = plan[first - 1], plan[final + 1]
+        if (before[0], before[5]) != (W[first], plan[first][5] + 1) or W[first] - plan[first][5] != R + 1:
+            return
+        if (after[0], after[5]) != (W[final] - 1, plan[final][5]) or W[final] - plan[final][5] != R + 1:
+            return
+        if self.LAZY_END is not None:
+            keep = [i for i in lazy if W[i] - plan[i][5] >= self.LAZY_END]
+            if keep and keep[-1] > first:
+                lazy = lazy[:lazy.index(keep[-1]) + 1]
+                final = lazy[-1]
+        m_in = 0
+        for i in lazy:
+            w, kappa = plan[i][0], plan[i][5]
+            m_out = (w - kappa - R).bit_length() + 1
+            plan[i][9] = (i > first and plan[i - 1][5] == kappa, m_in, m_out, i == final)
+            m_in = m_out
+
+    @staticmethod
+    def _lag_counts(c, digits=0):
+        """For c count wires: the adders that count them, and per shift stage j the cells under the
+        front whose swap waits on the count's lower bits. With digits, the wires are c / 2 of weight
+        1 and the binary digits of a number below 2^digits <= c / 2 + 1."""
+        J, adders = c.bit_length(), 0
+        sizes = [c // 2 + 1] + [1] * (digits - 1) if digits else [c]
+        sizes += [0] * (J + 1 - len(sizes))
+        for j in range(J):
+            carries = 0
+            while sizes[j] >= 2:
+                sizes[j] -= 2 if sizes[j] >= 3 else 1
+                carries += 1
+            adders += carries
+            sizes[j + 1] += carries
+        assert sizes[J] == 0 and all(sizes[:J])
+        return adders, [min((1 << j) - 1, c - (1 << j)) if j == J - 1 else (1 << j) - 1 for j in range(J)]
+
+    def _lag_cost(self, c, cells, digits=0):
+        """CCX of _realign on c count wires with this many cells from the front up."""
+        adders, under = self._lag_counts(c, digits)
+        return 2 * (adders + sum(under)) + sum(under) + c.bit_length() * cells
+
+    @staticmethod
+    @functools.cache
+    def _thermo_cases(c):
+        """For a block of c = 2^J - 1 ticks, the flag-off patterns left_e = NOT z_(e+1) that are not 0s
+        then 1s, grouped by (j, es): j the last tick whose flag comes back on (left_(j-1) = 1, left_j = 0),
+        es the first tick after it that turns the flag off, or None if it stays on. Each maps to the
+        most the thermometer count can take there: the number whose binary digits are the XORs that
+        count a thermometer, plus the strips that can count (a tick whose flag found is off)."""
+        out = {}
+        for bits in range(1 << c):
+            left = [bits >> e & 1 for e in range(c)]
+            if all(left[e] <= left[e + 1] for e in range(c - 1)):
+                continue
+            j = max(e for e in range(1, c) if left[e - 1] and not left[e])
+            es = next((e for e in range(j, c) if left[e]), None)
+            count = DialogMultiplier._thermo_count(left) + 1 + sum(left[:c - 1])
+            out[j, es] = max(out.get((j, es), 0), count)
+        return out
+
+    @staticmethod
+    def _thermo_count(left):
+        """The number whose digit j is the XOR of left_(c - m) over the m in 1 .. c where m - 1 and m differ
+        in bit j: the count of left when it is 0s then 1s."""
+        c = len(left)
+        return sum((sum(left[c - m] for m in range(1, c + 1) if (m ^ (m - 1)) >> j & 1) & 1) << j
+                   for j in range(c.bit_length()))
+
+    def _thermo(self, K, front, c):
+        """1 when a block of c ticks with thresholds K (and K[c] the tick after's) may count its flag-off
+        bits as a thermometer. With a word in the far cells they are 0s then 1s and the count is exact.
+        Otherwise X is 0 and only V's word must lie under front - k'. If the flag is on at the end, V is
+        below 2^K_c (Jp). Else it went off at es by a subtract that swapped, u < 2^K_j since tick j:
+        after es u < 2^K_es, and v < 2^(K_j - 1) halves each tick while v >= u, where alone a pending
+        borrow can be (it needs v >= 3 2^kappa > u), and the physical word is below 4 v. Blocks over
+        15 ticks keep the plain count: the check walks 2^c patterns."""
+        if not 3 <= c <= 15 or c & (c + 1):
+            return 0
+        for (j, es), count in self._thermo_cases(c).items():
+            bound = K[c] if es is None else max(K[es], K[j] + 1 - (c - 1 - es))
+            if front - count < bound:
+                return 0
+        return 1
+
+    def _lag_plan(self, plan):
+        """Mark the lag blocks: runs of lazy ticks, none the lazy run's first or last, of a length
+        from LAG_BLOCK. Through a block of c ticks with front F the cells from F up are one
+        register X for U's word and V's (the joint domain leaves at most one of them a bit there),
+        and no gate of the block's ticks touches it. Under the front V shifts as ever: the relabel
+        brings a 0 in under the front each tick, and so does each second strip that counts,
+        x = two AND NOT flag. While U holds the word (the flag is set when the tick ends) X holds
+        U's bits from F up, U's own wires being 0 there, and a 0 under the front is a 0 of V, which
+        is below 2^kappa. A subtract that takes U's word to V moves only the cells under the
+        front, and from then on X is V's and lags: after lag = sum of (NOT flag left by the tick)
+        + sum of x, a cell i >= F holds V's bit i - lag and the cells [F - lag, F) are 0. _realign
+        closes them after the last tick. F is the least front with F - 2 e >= cut_e + 2 for every
+        tick e but the last, so that with at most 2 e holes before the tick, and one more after
+        its strip, the cells it reads and the one its strip brings down, up to cut + 1, are V's
+        own; the last tick needs only what it reads, F - 2 e >= cut_e + 1. That also
+        keeps a U whose flag came on at tick e, which is below 2^kappa_(e-1), under the at most
+        2 e holes counted by then, so the move lands under them. F is at most the width after the
+        block. A run of blocks starts and ends by swapping the far cells of U and V on the flag;
+        between two blocks the cells between their fronts are swapped on it. Each tick gets
+        (front, c, e, size), size the wires V has when the block starts. The run is the choice
+        that saves the most."""
+        lengths = self.LAG_BLOCK if isinstance(self.LAG_BLOCK, tuple) else (self.LAG_BLOCK,)
+        R, W, T = self.LAZY_WINDOW, self.widths, len(plan)
+
+        lo, hi = self.LAG_SPAN or (0, T)
+
+        def inner(i):
+            return lo <= i <= hi and 0 <= i < T and plan[i] and plan[i][9] and plan[i][9][1] != 0 and not plan[i][9][3]
+
+        def block(i, c):
+            """(CCX saved, front) of a block of c ticks from tick i, or None."""
+            ticks = range(i, i + c)
+            if not c or not all(inner(t) for t in ticks):
+                return None
+            kappa = [plan[t][5] for t in ticks]
+            front = max(kappa[e] + R + 2 * e + 2 - (e == c - 1) for e in range(c))
+            if front > W[i + c] or front < 2 * c:
+                return None
+            eager = sum(2 * plan[t][0] - 1 - plan[t][1] - plan[t][5] - R for t in ticks)
+            digits = c.bit_length() * self._thermo(kappa + [plan[i + c][5]], front, c)
+            mine = (sum(2 * front - 2 - kappa[e] - R for e in range(c)) + 3 * c
+                    + self._lag_cost(2 * c, W[i] + 1 - front - self._top_free(plan, i), digits))
+            return eager - mine, front
+
+        choice = [None] * T
+        if self.LAG_MIN_SAVING is None:
+            i = 0
+            while i < T:
+                found = next(((c, block(i, c)) for c in lengths if block(i, c)), None)
+                if found:
+                    choice[i] = (found[0], found[1][1])
+                i += found[0] if found else 1
+        else:
+            # best[i]: the most a run that ends before tick i saves, its entry swap paid.
+            best, back = [None] * (T + 1), [None] * (T + 1)
+            for i in range(T):
+                for c in lengths:
+                    found = block(i, c)
+                    if found is None:
+                        continue
+                    saved, front = found
+                    start, prev = -(W[i] - front), None
+                    if best[i] is not None and best[i] - abs(back[i][2] - front) > start:
+                        start, prev = best[i] - abs(back[i][2] - front), i
+                    if best[i + c] is None or start + saved > best[i + c]:
+                        best[i + c], back[i + c] = start + saved, (i, c, front, prev)
+            ends = [(best[i] - (W[i] - back[i][2]), i) for i in range(T + 1) if best[i] is not None]
+            if ends and max(ends)[0] >= self.LAG_MIN_SAVING:
+                i = max(ends)[1]
+                while i is not None:
+                    start, c, front, i = back[i]
+                    choice[start] = (c, front)
+        for i, found in enumerate(choice):
+            if found:
+                c, front = found
+                for e in range(c):
+                    plan[i + e][10] = (front, c, e, W[i] + 1)
+
+    def _top_free(self, plan, i):
+        """1 when X's top cell, V's extra wire w, is 0 through a lag block that starts at tick i, so
+        _realign leaves it out: X is never written in the block, U is below 2^w, and so is the lazy V
+        on entry. P = Y + p 2^cut. With p = 0, P = Y < 2^w. On a top_clear tick Y < 2^(w - 1) and
+        cut < w. Otherwise, while p is pending v >= 3 * 2^kappa > u, so v^2 <= u v^2 <= Psi_t <= B_t;
+        when B_t < 2^(2w - 1) that is Y <= v < 2^(w - 1/2), and P < 2^w for 2^cut <= 2^(w - 2)."""
+        q = self.mod.q
+        w, kappa = plan[i][0], plan[i][5]
+        bound = (2 * q * q * (q - 1)) >> 2 * i
+        return int(bool(plan[i][1]) or (bound.bit_length() < 2 * w and w - kappa >= 4))
+
+    def _lag_tally(self, after, flag, digits, tally):
+        """XOR into tally the block's flag-off bits left_e = NOT z_(e+1), one a wire, or with digits their
+        count as a thermometer: digit j takes left_e for each m = c - e where m - 1 and m differ in bit j.
+        after holds what each tick's flag update left: a drop keeps the flag it found on its old wire, and
+        a same tick's flag found is the flag it leaves XOR its g0 * flag, which are never both set; flag is
+        the flag the last tick leaves."""
+        c = len(after)
+        for e in range(c):
+            for j, wire in enumerate(tally):
+                if not (j == e if not digits else ((c - e) ^ (c - e - 1)) >> j & 1):
+                    continue
+                k = e + 1
+                while k < c and after[k][0] == "same":
+                    self.C.cx(after[k][1], wire)
+                    k += 1
+                self.C.cx(after[k][1] if k < c else flag, wire)
+                self.C.x(wire)
+
+    def _lag_clear(self, after, flag, borrowed):
+        """Clear the counted strips x = two AND NOT flag of a block's ticks that kept their threshold,
+        each (e, wire, cell). After such a tick the cell's b is two XOR g1, and g1 implies g0; the flag
+        update left g0 * flag on its wire and flag AND NOT g0 on the flag's, so
+        NOT g0 AND NOT flag = 1 ^ g0 ^ (the flag the tick left), which is linear in what the block's
+        end still holds, as in _lag_tally. Then x = b AND NOT (g0 ^ flag left), one CCX on a clean
+        wire that takes that XOR, and the strip's wire goes back clean."""
+        C, c = self.C, len(after)
+        for e, wire, (g0, b) in borrowed:
+            (left,) = C.alloc(1)
+            sources, k = [g0], e + 1
+            while k < c and after[k][0] == "same":
+                sources.append(after[k][1])
+                k += 1
+            sources.append(after[k][1] if k < c else flag)
+            for src in sources:
+                C.cx(src, left)
+            C.x(left)
+            C.ccx(b, left, wire)
+            C.x(left)
+            for src in reversed(sources):
+                C.cx(src, left)
+            C.free([left, wire])
+
+    def _realign(self, c, cells, digits=0):
+        """Close a lag block's holes. V is the cells from c below the front up, xs the block's c
+        count bits, k their sum (with digits, c / 2 strips and then the digits, low first, of a
+        number added to them): the cells [front - k, front) are 0, and every cell from the front up
+        moves down k places, zeros coming in on top. The count is made by adders on scratch, and
+        the shift goes low bit first: at stage j the cells from front - r up, r = k mod 2^j, move
+        down 2^j, so the swaps of the 2^j - 1 cells under the front wait on k_j AND [r >= m], which
+        are the upper half of the next stage's thresholds [k mod 2^(j+1) >= 2^j + m]."""
+        key = (c, cells, digits)
+        if key not in self._realigns:
+            C = self.C
+            J = c.bit_length()
+            adders, under = self._lag_counts(c, digits)
+            n = c // 2 + digits if digits else c
+
+            def body(V, xs, scratch):
+                undo, free = [], list(scratch)
+
+                def cx(a, b):
+                    C.cx(a, b)
+                    undo.append((a, b))
+
+                def ccx(a, b, t):
+                    C.ccx(a, b, t)
+                    undo.append((a, b, t))
+
+                buckets, k = [list(xs[:n - digits])] + [[] for _ in range(J)], []
+                for j, d in enumerate(xs[n - digits:]):
+                    buckets[j].append(d)
+                for j in range(J):
+                    ws = buckets[j]
+                    while len(ws) >= 2:
+                        s = free.pop(0)
+                        if len(ws) >= 3:
+                            # s = MAJ(a, b, d) = a ^ (a ^ b)(a ^ d), and d takes the sum.
+                            a, b, d = ws[:3]
+                            del ws[:3]
+                            cx(a, b)
+                            cx(a, d)
+                            ccx(b, d, s)
+                            cx(a, s)
+                            cx(b, d)
+                            cx(a, d)
+                            ws.append(d)
+                        else:
+                            a, b = ws[:2]
+                            del ws[:2]
+                            ccx(a, b, s)
+                            cx(a, b)
+                            ws.append(b)
+                        buckets[j + 1].append(s)
+                    k.append(ws[0])
+                front, th = c, []
+                for j in range(J):
+                    prods = []
+                    for m in range(under[j]):
+                        prods.append(free.pop(0))
+                        ccx(k[j], th[m], prods[m])
+                    for i in range(front - under[j], len(V)):
+                        cswap(C, prods[front - i - 1] if i < front else k[j], [V[i - (1 << j)]], [V[i]])
+                    if j < J - 1:
+                        # [r >= m] becomes k_j OR [r >= m] = k_j ^ [r >= m] ^ k_j [r >= m].
+                        for m in range(under[j]):
+                            cx(k[j], th[m])
+                            cx(prods[m], th[m])
+                        th = th + [k[j]] + prods
+                for gate in reversed(undo):
+                    (C.cx if len(gate) == 2 else C.ccx)(*gate)
+
+            self._realigns[key] = C.record_shape(body, [c + cells, n, adders + sum(under)])
+        return self._realigns[key]
+
+    def _far_swap(self, flag, U, V, lo, hi):
+        """On the flag, U's cells [lo, hi) change places with V's, which are 0 there."""
+        for j in range(lo, hi):
+            cswap(self.C, flag, [U[j]], [V[j]])
+
+    def _lazy_width(self, plan):
+        """The widest the lazy counter gets."""
+        return max((key[9][2] for key in plan if key and key[9]), default=0)
+
+    def _lazy_kept(self, plan):
+        """Counter wires the lazy run leaves as junk: the last tick's m_out when the run ends at a
+        longer word, where the counter stays as it stands, and none when it ends at
+        LAZY_WINDOW + 1 bits, where the last tick clears it. The counter's wires above that are
+        0 again by then, each shrink clearing the sign copies it drops, and so is V's extra wire:
+        the pass borrows those and gives them back."""
+        last = next((key for key in plan if key and key[9] and key[9][3]), None)
+        if last is None:
+            return 0
+        return last[9][2] if last[0] - last[5] > self.LAZY_WINDOW + 1 else 0
+
+    def _junk_sizes(self):
+        """Junk wires each tick leaves for the inverse pass: its carries, the flag it makes, the
+        wire its flag update leaves, a lazy tick's, and the retired offset. A lazy tick leaves
+        the wire that held p if the tick is raw, its counted strip if it is in a lag block and
+        _lag_clear does not clear it, and b * r, r the bit its second strip brings to the window's top
+        (b * p without STRIP_BIT_JUNK); the first one brings p and the counter wires that _lazy_kept counts."""
+        plan = self._tick_plan()
+        kept = self._lazy_kept(plan)
+
+        def lazy(key):
+            strip = bool(key[10]) and not (self.LAG_CLEAR and key[7] == "same")
+            return (1 + kept if key[9][1] == 0 else 0) + key[9][0] + 1 + strip if key[9] else 0
+
+        return [0 if key is None or key[3] else 1 + key[4] + (key[7] in ("same", "drop")) + key[8] + lazy(key)
+                for key in plan]
+
+    @property
+    def junk_width(self):
+        """The pass's junk: E, then each tick's."""
+        return 1 + sum(self._junk_sizes())
+
+    @property
+    def inline_sweep(self):
+        """The Bezout pass sweeps B1 itself, on a tape the Euclid pass leaves unswept."""
+        return self.INLINE_SWEEP and self.swept and not self.blocks
+
+    @property
+    def rank_j(self):
+        """How many cells the Bezout pass's rank-one start takes: T - 1 down to T - J."""
+        T = self.iters
+        lend_tail = T > 1 and self.blocks * TICKS < T
+        tail = (not self.RAW_TAPE and lend_tail and T >= tail_code.CELLS + 1
+                and T - self.blocks * TICKS >= tail_code.CELLS
+                and tick_widths(self.mod.q, T)[T - tail_code.CELLS] <= 6)
+        return self._rank_j(lend_tail, tail)
+
+    @property
+    def sweep_top(self):
+        """The first cell of the inline sweep's chain: the highest that a general tick reads."""
+        return self.iters - max(self.rank_j, 1) - 1
+
+    @property
+    def swap_width(self):
+        """Swap wires: one for each of cells 1 to sweep_top."""
+        return max(self.sweep_top, 0) if self.SWAP_WIRES and self.inline_sweep else 0
+
+    def _euclid_pass(self, U: list[int], pool: list[int], junk: list[int], block0_raw: bool = False,
+                     sweep: bool = True, swr: list[int] | None = None, keep: list[int] | None = None) -> None:
+        # swr, if given, starts zero and ends with the swap bits of cells 1 to len(swr).
+        # keep, if given, starts zero and ends with copies of the pass's last small states, which the
+        # Bezout pass's rank-one conversion reads: U before each of the last J ticks, and V and
+        # the offset before the first of them.
         # The pool starts as V plus clean external tape. It ends as the zero wires U did not
         # take back, then tape; U ends as its low wires and those zero wires. The boundary is a
-        # permutation of U and the pool together.
+        # permutation of U and the pool together. junk starts zero and ends holding each tick's
+        # junk, which only the inverse pass clears.
         n = self.mod.n
         V, available, G = pool[:n], pool[n:], []
         lend = U[n - self.u_lent:]
-        E = self.C.alloc(1)
-        k = self._tick0_scratch()
+        E = junk[:1]
+        plan, sizes, used, flag = self._tick_plan(), self._junk_sizes(), 1, []
+        counter, lent, pending = self._lazy_width(plan), [], []
+        strips, after, whole, borrowed = [], [], False, []
+        assert len(junk) == 1 + sum(sizes)
+        kept = self._rank(self.rank_j) if keep else None
         for i in range(self.iters):
             w = self.widths[i]
-            assert len(V) == w and len(available) >= 2
+            assert (whole or len(V) == w) and len(available) >= 2
             cell, available = available[:2], available[2:]
-            tick0 = self._euclid_tick0() if i == 0 and w == n and len(available) >= k else None
-            if tick0 is not None and tick0.wires <= set(tick0.flat_in) and set(tick0.flat_out) == set(tick0.flat_in):
-                self.C.apply(tick0, [U, V, E, cell, available[:k]])
+            if kept and 2 <= self.iters - i <= kept.J:
+                assert not whole and not (plan[i] and (plan[i][9] or plan[i][10]))
+                kept.keep_state(self.C, self.iters - i, U[:w], V, E, keep)
+            if plan[i] is None:
+                self.C.apply(self._euclid_tick0(), [U, V, E, cell])
             else:
-                # Alternate clean scratch so adjacent carry and strip sweeps can overlap.
-                hold = self.C.alloc(1) if i % 2 else []
-                k = _ring_size(w, len(available))
-                full = tree_temps(w + 1, 1)
-                borrow = (self.C.alloc(full - len(available))
-                          if WIDE_RING and k < full <= len(available) + RING_BORROW else [])
-                ring = available + borrow if borrow else available[:k]
-                self.C.apply(self._euclid_step(w, len(ring)), [U[:w], V, E, cell, ring])
-                self.C.free(borrow)
-                self.C.free(hold)
+                key = plan[i]
+                tick_junk = junk[used:used + sizes[i]]
+                used += sizes[i]
+                # The tick's junk: its carries, the flag it makes, its flag update's wire, g1's.
+                extra = tick_junk[key[4]:-1]
+                if key[8]:
+                    flag = [extra.pop(0)]
+                held = flag if key[7] else []
+                slot = [extra.pop(0)] if key[7] in ("same", "drop") else []
+                lz = []
+                if key[9]:
+                    if key[9][1] == 0:
+                        # V's extra wire and the counter's upper wires are borrowed to the run's end.
+                        lk = self._lazy_kept(plan)
+                        pending, lent = [extra[0]], self.C.alloc(counter - lk)
+                        count = extra[1:1 + lk] + lent
+                        V.append(self.C.alloc(1)[0])
+                        del extra[:1 + lk]
+                    elif not whole:
+                        V.append(spare)
+                    lz = pending + count[:max(key[9][1:3])]
+                if key[10]:
+                    front, c, e, size = key[10]
+                    if e == 0:
+                        assert len(V) == size
+                        if not (plan[i - 1] and plan[i - 1][10]):
+                            self._far_swap(held[0], U, V, front, w)
+                        # V keeps every wire it has to the block's end.
+                        whole = True
+                    if self.LAG_CLEAR and key[7] == "same":
+                        # The strip's wire is borrowed to the block's end, where _lag_clear clears it.
+                        extra.insert(len(extra) - 1, self.C.alloc(1)[0])
+                        borrowed.append((e, extra[-2], cell))
+                    strips.append(extra[-2])
+                scratch = (available + junk[used:])[:self._step_scratch(key)]
+                assert len(scratch) == self._step_scratch(key)
+                on_sw = swr is not None and 1 <= i <= len(swr)
+                self.C.apply(self._euclid_step(*key, on_sw=on_sw),
+                             [U[:w], V, E, cell, tick_junk[:key[4]] + tick_junk[-1:], held, slot, scratch,
+                              lz, extra if key[9] else [], [swr[i - 1]] if on_sw else []])
+                if key[7]:
+                    flag = held
+                if key[10]:
+                    # What the flag update left: g0 * flag on a same tick, the flag it found on a drop.
+                    after.append((key[7], slot[0]))
+                if key[9]:
+                    pending = lz[:1]
             G.extend(cell)
             next_width = self.widths[i + 1] if i + 1 < self.iters else self.pass_tail_width
             assert w - 1 <= next_width <= w
-            available.extend(V[next_width:])
-            V[:] = V[:next_width]
+            if plan[i] is not None and plan[i][9]:
+                far = plan[i][10]
+                if far and far[2] == far[1] - 1:
+                    front, c = far[:2]
+                    cells = V[front - 2 * c:len(V) - self._top_free(plan, i - c + 1)]
+                    digits = c.bit_length() * self._thermo([plan[i - c + 1 + e][5] for e in range(c + 1)], front, c)
+                    adders, under = self._lag_counts(2 * c, digits)
+                    scratch = (available + junk[used:])[:adders + sum(under)]
+                    assert len(scratch) == adders + sum(under)
+                    tally = list(self.C.alloc(digits or c))
+                    self._lag_tally(after, flag[0], digits, tally)
+                    self.C.apply(self._realign(2 * c, len(cells) - 2 * c, digits), [cells, strips + tally, scratch])
+                    self._lag_tally(after, flag[0], digits, tally)
+                    self.C.free(tally)
+                    self._lag_clear(after, flag[0], borrowed)
+                    strips, after, whole, borrowed = [], [], False, []
+                if not whole:
+                    # V's extra wire stays above the next width; the run's last tick leaves it clear,
+                    # and the counter's borrowed wires with it.
+                    spare = V.pop(next_width)
+                    if plan[i][9][3]:
+                        self.C.free([spare] + lent)
+                    if far:
+                        # U's word under the next front, or all of it after the run's last block,
+                        # goes back to U's own cells.
+                        nxt = plan[i + 1] and plan[i + 1][10]
+                        lo, hi = sorted((front, nxt[0])) if nxt else (front, next_width)
+                        self._far_swap(flag[0], U, V, lo, hi)
+            if not whole:
+                available.extend(V[next_width:])
+                V[:] = V[:next_width]
             # By L6, u < 2**next_width from here on, and later steps touch only U[:w] for
             # w <= next_width, so U's wires from next_width up are zero for the rest of the pass.
             available.extend(reversed([u for u in U[next_width:w] if u in lend]))
         assert len(V) == self.pass_tail_width and not available
-        # Sweep down, coding each block as it finishes. The offset sweep leaves b on a
-        # no-subtract tick alone. On the merged path the B1 sweep follows one cell behind it,
-        # so a block is coded only after the B1 step that reads its bottom cell.
+        # Each subtract cell already holds its own swap. On the merged path the B1 sweep runs
+        # down the tape, and a block is coded only after the B1 step that reads its bottom cell.
         T, swept, clean = self.iters, self.swept, []
-        both = None
+        # Without sweep the pass leaves the tape unswept, for a Bezout pass that sweeps it inline.
+        assert sweep or not self.blocks
 
-        def mark(k):
-            self.C.x(G[2 * k])
-            self.C.x(G[2 * k - 2])
-            self.C.ccx(G[2 * k], G[2 * k - 2], both)
-            self.C.x(G[2 * k - 2])
-            self.C.x(G[2 * k])
+        def done(i):
+            k = i + 1 if swept else i
+            if k % TICKS == 0 and k // TICKS < self.blocks:
+                clean.extend(self._encode(G, k // TICKS, swept))
 
-        if swept and T >= 2:
-            (both,) = self.C.alloc(1)
-            mark(T - 1)
-        for i in range(T - 1, -1, -1):
-            cswap(self.C, G[2 * i], E, [G[2 * i + 1]])
-            if swept and i + 1 < T:
-                k = i + 1
-                self._b1_step(G, k, both)
-                if k >= 2:
-                    # Turn mark(k,k-1) into mark(k-1,k-2) before any encode.
-                    self.C.cx(G[2 * k - 4], G[2 * k])
-                    self.C.x(G[2 * k - 2])
-                    self.C.ccx(G[2 * k - 2], G[2 * k], both)
-                    self.C.x(G[2 * k - 2])
-                    self.C.cx(G[2 * k - 4], G[2 * k])
-                else:
-                    mark(1)
-            done = i + 1 if swept else i
-            if done % TICKS == 0 and done // TICKS < self.blocks:
-                # Rotate the encoder's clean wires, so that a block's encode overlaps the next ones.
-                hold = self.C.alloc(tape_block.ANCILLAS * (done // TICKS % ENCODE_SETS))
-                clean.extend(self._encode(G, done // TICKS, swept))
-                self.C.free(hold)
-        if both is not None:
-            self.C.free([both])
+        if swept and sweep:
+            self._b1_sweep(G, 1, done)
+        else:
+            for i in range(T - 1, -1, -1):
+                done(i)
+        # Block 0's free wires take their places among the zero words raw, and block 0 is coded
+        # last, unless block0_raw leaves that to the caller.
+        raw = []
         if swept and self.blocks:
-            clean.extend(self._encode(G, 0, swept))
-        self.C.free(E)
-        zeros = V + clean
+            raw = [G[slot] for slot in self._free_slots(0, swept)]
+            for slot in self._free_slots(0, swept):
+                G[slot] = None
+        zeros = V + clean + raw
         U[:] = U[:n - self.u_lent] + zeros[:self.u_lent]
         pool[:] = zeros[self.u_lent:] + [w for w in G if w is not None]
+        if raw and not block0_raw:
+            self._code_block0(U, pool)
+
+    def _b1_sweep(self, G, lo=1, done=None):
+        """Rotate each no-subtract run of the tape G so B1 is last in Bezout order: steps T - 2 down
+        to lo, step k swapping b_k and b_(k-1) when neither cell subtracts. lo = 1 sweeps the whole
+        tape. done(i) is called once cell i's steps are over."""
+        C, T = self.C, self.iters
+
+        def mark(k):
+            C.x(G[2 * k])
+            C.x(G[2 * k - 2])
+            C.ccx(G[2 * k], G[2 * k - 2], both)
+            C.x(G[2 * k - 2])
+            C.x(G[2 * k])
+
+        # The pass reaches (1, 0) within T ticks, and each no-subtract cell after its last subtract
+        # has b = 1. So when cells T - 1 and T - 2 are both no-subtract their b are equal: the B1
+        # step between them never swaps, and the first mark is mark(T - 2).
+        top = T - 2 if T >= 3 else T - 1
+        both = None
+        if top >= lo >= 1:
+            (both,) = C.alloc(1)
+            mark(top)
+        for i in range(T - 1, -1, -1):
+            k = i + 1
+            if lo <= k <= top:
+                self._b1_step(G, k, both)
+                if k > lo:
+                    # Turn mark(k,k-1) into mark(k-1,k-2) before any encode.
+                    C.cx(G[2 * k - 4], G[2 * k])
+                    C.x(G[2 * k - 2])
+                    C.ccx(G[2 * k - 2], G[2 * k], both)
+                    C.x(G[2 * k - 2])
+                    C.cx(G[2 * k - 4], G[2 * k])
+                else:
+                    mark(k)
+            if done is not None:
+                done(i)
+        if both is not None:
+            C.free([both])
+
+    def _sweep_sw(self, G, swr):
+        """The B1 sweep as a Bezout pass with swap wires applies it: the rank-one start's steps,
+        then cell sweep_top down to 0 as TwoBitMod.tick does, 1 CCX a cell, since s = g0 AND x on
+        swr makes B1 linear. Its inverse unsweeps the tape that pass leaves."""
+        C, T, tw, top = self.C, self.iters, self.narrow, self.sweep_top
+        if self.rank_j:
+            self._b1_sweep(G, T - self.rank_j)
+        (tog,) = C.alloc(1)
+        for i in range(top, -1, -1):
+            g0, b = G[2 * i], G[2 * i + 1]
+            up = None if i == top else G[2 * i + 2]
+            C.cx(tog, b)
+            if i:
+                tw._sweep_in(C, g0, b, swr[i - 1], up, G[2 * i - 2], tog)
+            elif up is not None:
+                # t_1 = NOT g0_1 AND B1_0, and B1_0 = NOT x_0. t_0 = 0.
+                C.x(b)
+                C.x(up)
+                C.ccx(b, up, tog)
+                C.x(up)
+                C.x(b)
+        C.free([tog])
 
     def _bezout(self):
         if self._bezout_step is None:
@@ -671,19 +1509,39 @@ class DialogMultiplier:
             self._bezout_step = C.record_shape(step, [2, mod.n, mod.n])
         return self._bezout_step
 
-    def _bezout_tick(self, first, last, pebble=False, consume=False, produce=False):
-        """consume: the previous cell's B1 mark arrives on a wire from the tick before.
-        produce: this tick leaves the next tick's mark, NOR of its own cell, on a given clean wire."""
-        key = first, last, pebble, consume, produce
+    def _bezout_tick(self, first, last, pebble=False, after=False, inline=False, tape=False):
+        """after marks a first tick that follows the terminal cell, where S is 0 or R. It takes
+        that cell's g0 as an argument. inline adds the wire that carries the B1 sweep's toggle.
+        tape adds the previous cell's swap wire and this cell's; flag is then H's two top bits
+        alone, as the B1 mark rides the swap wires."""
+        key = (first, last, pebble, after, inline, tape)
         if key not in self._bezout_ticks:
             C, n = self.C, self.mod.n
 
-            def tick(prev, g, nxt, R, S, pin, pout):
-                self.narrow.tick(C, prev or None, g, nxt[0] if nxt else None,
-                                 R, S, pebble=pebble, pin=pin[0] if pin else None,
-                                 pout=pout[0] if pout else None)
+            def taped(prev, g, nxt, R, S, tau, tog, psw, gsw, flag):
+                out = self.narrow.tick(C, prev or None, g, nxt[0] if nxt else None, R, S,
+                                       pebble=pebble, held=(psw or [None]) + flag, cell0=last,
+                                       tau=tau[0] if after else None, tog=tog[0],
+                                       sw=gsw[0] if gsw else None, tape=True)
+                flag[:] = [] if out is None else out[1:]
 
-            sizes = [0 if first else 2, 2, 0 if last else 1, n, n, int(consume), int(produce)]
+            if tape:
+                # flag comes last: a last tick's output leaves it empty.
+                sizes = [0 if first else 2, 2, 0 if last else 1, n, n, int(after), 1,
+                         0 if first else 1, 0 if last else 1, 2]
+                self._bezout_ticks[key] = C.record_shape(taped, sizes)
+                return self._bezout_ticks[key]
+
+            def tick(prev, g, nxt, R, S, tau, tog, flag):
+                # flag comes in holding [previous cell is B1] and H's two top bits, or 0 on a
+                # first tick, which has no previous cell, and goes out holding this cell's, or
+                # empty after the last.
+                out = self.narrow.tick(C, prev or None, g, nxt[0] if nxt else None, R, S,
+                                       pebble=pebble, held=flag, cell0=last,
+                                       tau=tau[0] if after else None, tog=tog[0] if inline else None)
+                flag[:] = [] if out is None else out
+
+            sizes = [0 if first else 2, 2, 0 if last else 1, n, n, int(after), int(inline), 3]
             self._bezout_ticks[key] = C.record_shape(tick, sizes)
         return self._bezout_ticks[key]
 
@@ -691,9 +1549,10 @@ class DialogMultiplier:
         """Use the pass-wide mark while both cells are still raw."""
         cswap(self.C, both, [G[2 * i + 1]], [G[2 * i - 1]])
 
-    def _bezout_pass(self, G, Yr, S):
+    def _bezout_pass(self, G, Yr, S, block0_raw=False, inline=False, swr=None, keep=None):
         """G is the coded tape. Each block is decoded on a clean wire before a tick reads it and
-        coded again once no tick reads it."""
+        coded again once no tick reads it, except block 0 on the merged path with block0_raw.
+        inline: G is unswept, and the pass sweeps it as it reads it. swr: the swap wires."""
         C, T, swept = self.C, self.iters, self.swept
         if not self.narrow.merged:
             bz = self._bezout()
@@ -709,8 +1568,8 @@ class DialogMultiplier:
         # one tick before its first tick and coded one tick after its last. Across each edge
         # two blocks are decoded for two ticks.
         if self.blocks * TICKS == T:
-            _aside(C, lambda: self._decode(G, self.blocks - 1,
-                                           C.alloc(len(self._block_free(self.blocks - 1, swept))), swept))
+            self._decode(G, self.blocks - 1,
+                         C.alloc(len(self._block_free(self.blocks - 1, swept))), swept)
             if self.blocks == 1:
                 block0_code.hold(C, self._block_wires(G, 0, swept))
                 C.free([G[1]])
@@ -718,30 +1577,28 @@ class DialogMultiplier:
         # The final swept cell is (1, 0) or (0, 1): the terminal subtract
         # is followed only by no-subtract cells. Lend its b only when uncoded.
         lend_tail = T > 1 and self.blocks * TICKS < T
-        tail = (lend_tail and T >= tail_code.CELLS + 1
+        tail = (not self.RAW_TAPE and lend_tail and T >= tail_code.CELLS + 1
                 and T - self.blocks * TICKS >= tail_code.CELLS
                 and tick_widths(self.mod.q, T)[T - tail_code.CELLS] <= 6)
         lo = 2 * (T - tail_code.CELLS)
         tail_encoded = False
-
-        def quiet(i):
-            """Nothing is emitted between tick call i and tick call i - 1, which has a prev."""
-            j = i - 1
-            if not HAND_OFF_MARK or i == T - 1 or j < 0:
-                return False
-            enc = (i + 1) % TICKS == 0 and i + 1 < T and (i + 1) // TICKS < self.blocks
-            tl = tail and i == T - tail_code.CELLS - 1
-            dec = j % TICKS == 0 and 0 <= j // TICKS - 1 < self.blocks
-            hold = j == 1 and self.blocks
-            np = lend_tail and j == T - 2
-            return not (enc or tl or dec or hold or np)
-
-        hand, mark_at = None, None
-        for i in reversed(range(T)):
+        flag = []
+        J = self._rank_j(lend_tail, tail)
+        assert not inline or (lend_tail and self.inline_sweep and J == self.rank_j)
+        assert swr is None or (inline and len(swr) == self.sweep_top)
+        if J:
+            if inline:
+                # The rank-one start reads cells T - 1 to T - J swept: steps T - 2 to T - J, the
+                # last of which leaves cell T - J - 1 as the sweep's next step finds it.
+                self._b1_sweep(G, T - J)
+            self._rank_start(G, Yr, S, J, keep)
+        # The sweep's toggle starts at 0: no step above reaches the first tick's cell unswept.
+        tog = C.alloc(1) if inline else []
+        for i in reversed(range(T - J)):
             nxt_block = i // TICKS - 1
             if i % TICKS == 0 and 0 <= nxt_block < self.blocks:
-                _aside(C, lambda: self._decode(G, nxt_block,
-                                               C.alloc(len(self._block_free(nxt_block, swept))), swept))
+                self._decode(G, nxt_block,
+                             C.alloc(len(self._block_free(nxt_block, swept))), swept)
                 if nxt_block == 0:
                     block0_code.hold(C, self._block_wires(G, 0, swept))
                     C.free([G[1]])
@@ -749,14 +1606,14 @@ class DialogMultiplier:
             if i == 1 and self.blocks:
                 G[1] = C.alloc(1)[0]
                 block0_code.hold(C, self._block_wires(G, 0, swept), inverse=True)
-            no_prev = lend_tail and i == T - 2
+            no_prev = lend_tail and i == T - 2 and not J
             if no_prev:
                 # The terminal cell is never B1; release b before its last reader.
                 C.cx(G[-2], G[-1])
                 C.x(G[-1])
                 C.free([G[-1]])
                 G[-1] = None
-            first, last = i == T - 1 or no_prev, i == 0
+            first, last = i == T - 1 or no_prev or (J and i == T - J - 1), i == 0
             edge = any(i in (j * TICKS, j * TICKS - 1) for j in range(1, self.blocks))
             pebble = edge or (tail and self.blocks > 0 and i == self.blocks * TICKS)
             pebble = pebble or (self.blocks > 0 and i in (0, 1))
@@ -767,28 +1624,38 @@ class DialogMultiplier:
                 for r, s in zip(Yr, S):
                     C.ccx(G[2 * i], r, s)
             else:
-                consume, produce = hand is not None, quiet(i)
-                if consume:
-                    # The mark is valid only if nothing ran since the tick that made it.
-                    assert mark_at == (len(C.prims), len(C.calls or ())) and not first
-                pin = [hand] if consume else []
-                pout = C.alloc(1) if produce else []
-                C.apply(self._bezout_tick(first, last, pebble, consume, produce),
-                        [prev, G[2 * i:2 * i + 2], nxt, Yr, S, pin, pout])
-                C.free(pin)
-                hand = pout[0] if produce else None
-                mark_at = (len(C.prims), len(C.calls or ()))
+                if not flag:
+                    # The pass's first tick call: no tick before it handed a flag over, and the
+                    # cell before, if any, is the terminal cell, never B1, so H's bits are 0.
+                    flag = C.alloc(2 if swr is not None else 3)
+                    assert first or swr is None
+                    if not first:
+                        self.narrow._mark_b1(C, prev, flag[0])
+                after = first and not last and i == T - 2
+                psw = [] if swr is None or first else [swr[i]]
+                if last and self._cutting:
+                    self._cell0_cut(prev, G[:2], Yr, S, flag, pebble, tog, psw, swr is not None)
+                elif swr is not None:
+                    C.apply(self._bezout_tick(first, last, pebble, after, inline, tape=True),
+                            [prev, G[2 * i:2 * i + 2], nxt, Yr, S, [G[2 * T - 2]] if after else [],
+                             tog, psw, [] if last else [swr[i - 1]], flag])
+                else:
+                    C.apply(self._bezout_tick(first, last, pebble, after, inline),
+                            [prev, G[2 * i:2 * i + 2], nxt, Yr, S, [G[2 * T - 2]] if after else [],
+                             tog, flag])
             prev_block = (i + 1) // TICKS
             if (i + 1) % TICKS == 0 and i + 1 < T and prev_block < self.blocks:
-                _aside(C, lambda: C.free(self._encode(G, prev_block, swept)))
+                C.free(self._encode(G, prev_block, swept))
             if tail and i == T - tail_code.CELLS - 1:
                 W = G[lo:lo + tail_code.LIVE]
                 tail_code.apply(C, W)
                 tail_encoded = True
                 C.free([W[tail_code.FREE[0]]])
                 G[lo + tail_code.FREE[0]] = None
-        if self.blocks:
-            _aside(C, lambda: C.free(self._encode(G, 0, swept)))
+        assert not flag
+        C.free(tog)
+        if self.blocks and not block0_raw:
+            C.free(self._encode(G, 0, swept))
         if tail:
             assert tail_encoded, "tail inverse requires its forward apply"
             G[lo + tail_code.FREE[0]] = C.alloc(1)[0]
@@ -798,13 +1665,72 @@ class DialogMultiplier:
             C.x(G[-1])
             C.cx(G[-2], G[-1])
 
+    def _rank_j(self, lend_tail, tail):
+        if not (self.RANK_J and self.RAW_TAPE and lend_tail and not tail and not self.blocks):
+            return 0
+        J = rank_one.plan(self.mod.q, self.iters, self.widths, self.RANK_J)
+        if J:
+            # The Euclid pass copies its last small states for the conversion, and it copies plain
+            # words: every lazy tick must be under the start.
+            lazy = [i for i, key in enumerate(self._tick_plan()) if key and (key[9] or key[10])]
+            J = min(J, self.iters - 1 - max(lazy, default=0))
+        return J if J >= 3 else 0
+
+    def _rank(self, J):
+        T = self.iters
+        return rank_one.RankOne(self.mod.q, J, self.widths[T - J], [1] + [self.widths[T - k] for k in range(1, J + 1)])
+
+    @property
+    def keep_width(self):
+        """Wires the Euclid pass fills for the rank-one conversion: see rank_one.RankOne.kept."""
+        J = self.rank_j
+        return self._rank(J).kept_size() if J else 0
+
+    def _rank_start(self, G, Yr, S, J, keep):
+        """Cells T - 1 down to T - J on unreduced integers, then one conversion. The tick after it
+        is a first tick: the last cell here is semantic, so no lane is held."""
+        C, T, n = self.C, self.iters, self.mod.n
+        ro = self._rank(J)
+        R, Sw = Yr + C.alloc(ro.L - n), S + C.alloc(ro.L - n)
+        term = G[2 * T - 2]
+        for r, s in zip(Yr, S):
+            C.ccx(term, r, s)
+        # The terminal cell is never B1; release b before its last reader.
+        C.cx(G[-2], G[-1])
+        C.x(G[-1])
+        C.free([G[-1]])
+        G[-1] = None
+        p = None
+        for i in range(T - 2, T - J, -1):
+            # After cell i the cofactors are below 2^widths[i]: the tick needs no wider words.
+            k = n + self.widths[i] + 3
+            Rk, Sk = R[:k], Sw[:k]
+            p = ro.tick(C, G[2 * i:2 * i + 2], G[2 * i + 2:2 * i + 4], p, Rk, Sk)
+            R[:k], Sw[:k] = Rk, Sk
+        i = T - J
+        ro.last_tick(C, G[2 * i:2 * i + 2], G[2 * i + 2:2 * i + 4], p, R, Sw)
+        cells = [G[2 * k:2 * k + 2] for k in range(T - 2, T - J - 1, -1)]
+        ro.convert(C, term, cells, R, Sw, keep, G[2 * (T - J - 1)])
+        Yr[:], S[:] = R, Sw
+
     def _body(self, Xr, Yr):
         C, q, n, T = self.C, self.mod.q, self.mod.n, self.iters
         U = C.alloc(n)
         load_const(C, U, q)
         pool = list(Xr) + C.alloc(self.tape_external)
 
-        E = C.run(self._euclid_pass, [U, pool])
+        # On the merged path block 0 stays decoded from Bezout's end into the inverse pass, so
+        # the pass is recorded without its last encode, which runs here instead.
+        raw0 = self.swept and self.blocks > 0
+        junk = C.alloc(self.junk_width)
+        inline = self.inline_sweep
+        swr = C.alloc(self.swap_width) if self.swap_width else None
+        keep = C.alloc(self.keep_width)
+        regs = [U, pool, junk, swr or [], keep]
+        E = C.run(lambda U, pool, junk, sw, keep: self._euclid_pass(U, pool, junk, raw0, not inline,
+                                                                    sw or None, keep), regs)
+        if raw0:
+            self._code_block0(U, pool)
         lent = self.lent_after_pass
         G = self.coded_tape(pool)
         # Terminal V and the wires the code freed are zero; lend them during Bezout.
@@ -813,84 +1739,150 @@ class DialogMultiplier:
         # the surviving V wire stays zero for the inverse Euclid boundary.
         C.x(U[0])
         S = U
-        self._bezout_pass(G, Yr, S)
+        self._bezout_pass(G, Yr, S, raw0, inline, swr, keep)
+        # Bezout swept the tape it read; the inverse pass needs it unswept.
+        if swr:
+            C.apply(C.record(self._sweep_sw, [G, swr]), [G, swr], inverse=True)
+        elif inline:
+            C.apply(C.record(lambda G: self._b1_sweep(G), [G]), [G], inverse=True)
+        if raw0:
+            raw = [G[slot] for slot in self._free_slots(0, True)]
+            for slot in self._free_slots(0, True):
+                G[slot] = None
         # Restore the tape boundary using the newly allocated tail wire.
         pool[lent:] = [w for w in G if w is not None]
         C.x(Yr[0])
         pool[:lent] = C.alloc(lent)
-        C.apply(E, [Yr, pool], inverse=True)
+        if raw0:
+            # Block 0's free wires take the places of the last zero words, which are released.
+            places = self._block0_places(Yr, pool)
+            C.free([reg[i] for reg, i in places])
+            for (reg, i), w in zip(places, raw):
+                reg[i] = w
+        C.apply(E, [Yr, pool, junk, swr or [], keep], inverse=True)
         load_const(C, Yr, q)
         Xr[:] = pool[:n]
-        C.free(Yr + pool[n:])
+        C.free(Yr + pool[n:] + junk + (swr or []) + keep)
         Yr[:] = S
 
-    def apply(self, Xr, Yr, inverse=False):
-        if self.block is None:
-            self.block = self.C.record(self._body, [Xr, Yr])
-        self.C.apply(self.block, [Xr, Yr], inverse)
+    def _cell0_cut(self, prev, g, R, S, flag, pebble, tog=(), psw=(), tape=False):
+        """Cell 0's tick, run in the body itself and cut at its zero test. That test is the tick's
+        one gt_into call, t ^= z*[S >> 1 > 0] against R's clean wires on the pass's final S; here
+        it emits nothing, and split()'s caller emits its own in the cut. two_bit.py stays as it is."""
+        C = self.C
 
+        def zero_test(C, a, b, t, ctrl=None):
+            assert a == S[:-1] and self._test is None
+            self._test = [S[-1:] + a, list(b), [t], [ctrl]]
+            C.cut()
 
-# AND the flags' bits by balanced trees instead of chains: the same CCX, log depth.
-EQ_TREE = True
+        saved, two_bit.gt_into = two_bit.gt_into, zero_test
+        try:
+            held = (list(psw) or [None]) + flag if tape else flag
+            out = self.narrow.tick(C, prev or None, g, None, R, S, pebble=pebble, held=held, cell0=True,
+                                   tog=tog[0] if tog else None, tape=tape)
+        finally:
+            two_bit.gt_into = saved
+        assert out is None
+        flag[:] = []
 
+    def split(self, Xr, Yr):
+        """Whether the body splits into two blocks around cell 0's zero test, so that apply can
+        take a test. It does not on a pass with no cell 0 tick."""
+        if self._halves is None:
+            self._cutting, self._test = True, None
+            self._halves = self.C.record_cut(self._body, [Xr, Yr]) or ()
+            self._cutting = False
+            if self._halves:
+                # Layout wires the second block never touches and ends on: clean at the cut and
+                # idle after it.
+                before, after = self._halves
+                idle = set(after.flat_out[len(Xr) + len(Yr):]) - after.wires
+                self._spare = [w for w in before.flat_in if w in idle][:4]
+                if len(self._spare) < 4:
+                    self._halves = ()
+        return bool(self._halves)
 
-def and_tree(C, wires):
-    """The AND of wires (at least one) on fresh wires by a balanced tree. Returns the root, which is
-    wires[0] itself for one wire, and the CCXs (a, b, t) in emission order, for clear_and."""
-    level, history = list(wires), []
-    while len(level) > 1:
-        nxt = []
-        for k in range(0, len(level) - 1, 2):
-            (t,) = C.alloc(1)
-            C.ccx(level[k], level[k + 1], t)
-            history.append((level[k], level[k + 1], t))
-            nxt.append(t)
-        if len(level) % 2:
-            nxt.append(level[-1])
-        level = nxt
-    return level[0], history
-
-
-def clear_and(C, history):
-    for a, b, t in reversed(history):
-        C.ccx(a, b, t)
-    C.free([t for _, _, t in history])
-
-
-def eq_const_into(C, ctrl, bits, value, target):
-    """XOR equality into target, optionally controlled by ctrl."""
-    flips = [w for i, w in enumerate(bits) if not value >> i & 1]
-    for w in flips:
-        C.x(w)
-    if EQ_TREE and (ctrl is not None or len(bits) > 1):
-        # ctrl joins last: callers pass a ctrl that is itself a tree's root, ready late.
-        if ctrl is not None:
-            root, history = and_tree(C, bits)
-            C.ccx(ctrl, root, target)
-            clear_and(C, history)
+    def apply(self, Xr, Yr, inverse=False, test=None, flag=None):
+        """test(S, R, t, z, k, scratch), allowed once split() holds, is emitted between the two
+        blocks in place of cell 0's zero test. It must do t ^= z*[s >= 2] for the pass's final S
+        value s, which sits on S with bit 0 inverted, and leave S, the n - 1 clean wires R and the
+        three clean scratch wires as found. k is the test's own flag wire. It rides a layout place
+        the second block never touches, so it costs no wire: a forward pass hands it to the test
+        clean and returns it; an inverse pass takes it as flag, and the test must clear it."""
+        C = self.C
+        if test is None:
+            if self.block is None:
+                self.block = C.record(self._body, [Xr, Yr])
+            C.apply(self.block, [Xr, Yr], inverse)
+            return None
+        before, after = self._halves
+        width = len(Xr) + len(Yr)
+        if inverse:
+            pad = after.flat_out[width:]
+            rest, i = C.alloc(len(pad) - 1), pad.index(self._spare[0])
+            regs = [Xr, Yr, rest[:i] + [flag] + rest[i:]]
         else:
-            h = len(bits) // 2
-            (lo, hl), (hi, hh) = and_tree(C, bits[:h]), and_tree(C, bits[h:])
-            C.ccx(lo, hi, target)
-            clear_and(C, hh)
-            clear_and(C, hl)
-        for w in flips:
-            C.x(w)
-        return
-    chain = []
-    acc = ctrl if ctrl is not None else bits[0]
-    factors = bits[:-1] if ctrl is not None else bits[1:-1]
-    for w in factors:
-        (a,) = C.alloc(1)
-        C.ccx(acc, w, a)
-        chain.append((acc, w, a))
-        acc = a
-    C.ccx(acc, bits[-1], target)
-    for acc, w, a in reversed(chain):
-        C.ccx(acc, w, a)
-    C.free([a for _, _, a in chain])
-    for w in flips:
-        C.x(w)
+            regs = [Xr, Yr, C.alloc(len(before.flat_in) - width)]
+        C.apply(after if inverse else before, regs, inverse)
+        at = dict(zip(before.flat_in, flatten(regs)))
+        S, R, (t,), (z,), (k, *scratch) = ([at[w] for w in ws] for ws in self._test + [self._spare])
+        assert inverse is False or k == flag
+        test(S, R, t, z, k, scratch)
+        C.apply(before if inverse else after, regs, inverse)
+        if not inverse:
+            regs[2].remove(k)
+        C.free(regs[2])
+        return None if inverse else k
+
+
+def zero_test_less(C, S, R, t, z, k, scratch, value, generic):
+    """DialogMultiplier.apply's test with a compare: t ^= z*[s >= 2] and k ^= g*[s < value], for
+    1 <= value < 2^n. generic(w) XORs the flag g into w.
+
+    A CX fan writes s = r ^ y*value, y on the wire of value's top bit and r on the rest. On y = 1,
+    s ^ value = r; on y = 0 it is r ^ value, whose top bit r lacks. So r's zero-prefix chain, on
+    R's wires, gives both the zero test and the compare."""
+    n = len(S)
+    C.x(S[0])
+    top = value.bit_length() - 1
+    y = S[top]
+    fan = [S[j] for j in range(n) if j != top and value >> j & 1]
+    for w in fan:
+        C.cx(y, w)
+    prefix = ZeroPrefix(C, S, [j for j in reversed(range(n)) if j != top], R)
+    prefix.build()
+    u, w, g = scratch
+    # s < 2 when r is zero above bit 0 and, unless value is 1, y = 0.
+    small = prefix.above(0)
+    C.cx(z, t)
+    prefix.xor(small, u)
+    if top == 0:
+        C.ccx(z, u, t)
+    else:
+        C.x(y)
+        C.ccx(y, u, w)
+        C.ccx(z, w, t)
+        C.ccx(y, u, w)
+        C.x(y)
+    prefix.xor(small, u)
+    on, off = prefix.less(value, 0), prefix.less(value, value)
+
+    def less():
+        prefix.xor(off, w)
+        prefix.xor(on ^ off, u)
+        C.ccx(y, u, w)
+        prefix.xor(on ^ off, u)
+
+    less()
+    generic(g)
+    C.ccx(g, w, k)
+    generic(g)
+    less()
+    prefix.clear()
+    for w in reversed(fan):
+        C.cx(y, w)
+    C.x(S[0])
 
 
 def encode(P, n):
@@ -910,10 +1902,13 @@ class ControlledPointAdd:
         self.exceptions = [(None, A), (A, twoA), (neg(A), None), (neg(twoA), neg(A))]
         enc = [encode(e, self.n) for e, _ in self.exceptions]
         assert len(set(enc)) == 4, "addend order must exceed 3"
-        self._square_blk = None
+        self.square_offset = SquareFold(self.mod).offset if SquareFold.applies(curve.q) else 0
+        # Where the fold can take 3a, the square's J is (Y^2 - 3a) mod q and the kernel adds no 3a.
+        # Its gates then depend on A, so the square is emitted inline, outside the definitions.
+        self._absorb = SquareFold(self.mod).absorb(3 * A[0] % curve.q) if SquareFold.applies(curve.q) else None
 
     def _mulsub(self, gen, Yr, Xr):
-        """X = X - gen * Y^2 mod q, Y untouched."""
+        """X = X - gen * (Y^2 - square_offset) mod q, or X - gen * (Y^2 - 3a) with _absorb, Y untouched."""
         C, mod, n = self.C, self.mod, self.n
         if SquareFold.applies(mod.q):
             self._square_mulsub(gen, Yr, Xr)
@@ -939,18 +1934,22 @@ class ControlledPointAdd:
 
     def _square_mulsub(self, gen, Yr, Xr):
         C, mod, n = self.C, self.mod, self.n
-        if self._square_blk is None:
-            fold = SquareFold(mod)
-            self._square_blk = C.record_shape(lambda y, j: fold.compute(C, y, j), [n, fold.junk])
-            self._modadd_blk = C.record_shape(lambda k, a, b: fold.modadd(C, a, b, k[0]), [1, n, n])
-            self._square_junk = fold.junk
-        J = C.alloc(self._square_junk)
-        C.apply(self._square_blk, [Yr, J])
+        fold = SquareFold(mod)
+        self._modadd_blk = C.record_shape(lambda k, a, b: fold.modadd(C, a, b, k[0]), [1, n, n])
+        J = C.alloc(fold.junk)
+        inline = self._absorb is not None
+        if inline:
+            cins, kappa = self._absorb
+            blk = C.record(lambda y, j: fold.compute(C, y, j, kappa, cins), [Yr, J])
+        else:
+            blk = C.record_shape(lambda y, j: fold.compute(C, y, j), [n, fold.junk])
+        C.apply(blk, [Yr, J], inline=inline)
         C.apply(self._modadd_blk, [[gen], J[:n], Xr], inverse=True)
-        C.apply(self._square_blk, [Yr, J], inverse=True)
+        C.apply(blk, [Yr, J], inverse=True, inline=inline)
         C.free(J)
 
-    def _kernel(self, c, gen, Xr, Yr, f0, f1):
+    def _kernel(self, c, gen, Xr, Yr, f0, f1, below):
+        """below holds gen*[x < a] and is cleared. Returns gen and a wire holding gen*[x3 <= a]."""
         C, mod, q = self.C, self.mod, self.curve.q
         a, b = self.A
 
@@ -958,40 +1957,59 @@ class ControlledPointAdd:
             if not inverse:
                 C.cx(gen, c)
                 C.cx(gen, f0)
+            # gen ^= NOT c AND (f0 XOR f1): no c = 0 word has f0 = 0 and f1 = 1.
+            C.cx(f1, f0)
             C.x(c)
-            C.x(f1)
-            (t,) = C.alloc(1)
-            C.ccx(c, f0, t)
-            C.ccx(t, f1, gen)
-            C.ccx(c, f0, t)
-            C.free([t])
-            C.x(f1)
+            C.ccx(c, f0, gen)
             C.x(c)
+            C.cx(f1, f0)
             if inverse:
                 C.cx(gen, f0)
                 C.cx(gen, c)
 
-        mod.cmodadd_const(C, gen, q - a, Xr)
-        mod.cmodadd_const(C, gen, q - b, Yr)
+        # Cell 0's zero test in M reads the final Y of each pass, top down. Emitted here with a
+        # compare, it clears the wrap flag of the first Y -= b and makes the last one's.
+        split = self.M.split(Xr, Yr)
+
+        def generic(w):
+            # gen, as recode's inverse makes it.
+            C.cx(f1, f0)
+            C.x(c)
+            C.ccx(c, f0, w)
+            C.x(c)
+            C.cx(f1, f0)
+
+        def test(value):
+            return (lambda *wires: zero_test_less(C, *wires, value, generic)) if split else None
+
+        mod.cmodadd_const(C, gen, q - a, Xr, k=below)
+        wrap = mod.cmodadd_const(C, gen, q - b, Yr, keep=split)
         C.ccx(f0, f1, Xr[0])
         recode()
         C.free([gen])
-        self.M.apply(Xr, Yr, inverse=True)
+        self.M.apply(Xr, Yr, inverse=True, test=test(q - b), flag=wrap)
         (gen,) = C.alloc(1)
         recode(inverse=True)
-        mod.cmodadd_const(C, gen, 3 * a, Xr)
+        if self._absorb is None:
+            mod.cmodadd_const(C, gen, 3 * a - self.square_offset, Xr)
         self._mulsub(gen, Yr, Xr)
         recode()
         C.free([gen])
-        self.M.apply(Xr, Yr)
+        wrap = self.M.apply(Xr, Yr, test=test(b))
         (gen,) = C.alloc(1)
         recode(inverse=True)
         C.ccx(f0, f1, Xr[0])
-        mod.creflect(C, gen, a, Xr)
-        mod.cmodadd_const(C, gen, q - b, Yr)
-        return gen
+        below = mod.creflect(C, gen, a, Xr, keep=True)
+        mod.cmodadd_const(C, gen, q - b, Yr, k=wrap)
+        return gen, below
 
-    def _eq_flags(self, c, Xr, Yr, flags, points):
+    def _eq_flags(self, c, Xr, Yr, flags, points, below=None):
+        """flags[i] ^= [the point is points[i]], c-controlled except on the x = 0 point.
+
+        below = (k, late) also does k ^= g*[x < pair_x], where g = c*~[x = 0] ^ (the other three
+        flags) is the generic lane's flag. Early (late false), the flags come in 0 and g reads them
+        once set. Late, they come in set and g reads them before they clear. g is 0 at x = pair_x
+        either way, so this is g*[x <= pair_x] too."""
         C, n = self.C, self.n
         groups = {}
         for f, p in zip(flags, points):
@@ -1000,59 +2018,148 @@ class ControlledPointAdd:
         assert len(groups) == 3 and len(groups.get(0, [])) == 1, "0/a-pair/2A groups"
         pair_x = next(x for x, leaves in groups.items() if len(leaves) == 2)
         single_x = next(x for x in groups if x not in (0, pair_x))
-        shared_zero = [i for i in range(n) if not ((pair_x | single_x) >> i & 1)]
-        shared_one = [i for i in range(n) if (pair_x & single_x) >> i & 1]
-        differing = [i for i in range(n) if (pair_x ^ single_x) >> i & 1]
+        # A CX network writes x = r ^ y1*pair_x ^ y2*single_x, with y1 and y2 on the two pivot
+        # wires and r, zero on the pivots, on the rest. Then x is 0, pair_x or single_x exactly when
+        # r = 0 and (y1, y2) is (0, 0), (1, 0) or (0, 1), so the three equalities share r's all-zero
+        # product. The pivots are the top bits of pair_x, single_x and their XOR (two places), so
+        # that the top bit of x ^ pair_x is r's top bit or a pivot on every (y1, y2) lane.
+        p1 = pair_x.bit_length() - 1
+        p2 = single_x.bit_length() - 1
+        if p2 == p1:
+            p2 = (pair_x ^ single_x).bit_length() - 1
+        col = lambda v: (v >> p1 & 1) | (v >> p2 & 1) << 1
+        pick = None
+        for ops in ((), ((0, 1),), ((1, 0),)):
+            rows = [1, 2]
+            for src, dst in ops:
+                rows[dst] ^= rows[src]
+            for i1 in (0, 1):
+                # Wire i1 must read 1 on pair_x and 0 on single_x, and the other wire the reverse.
+                on = lambda i, v: (rows[i] & col(v)).bit_count() & 1
+                if (on(i1, pair_x), on(i1, single_x), on(1 - i1, pair_x), on(1 - i1, single_x)) == (1, 0, 0, 1):
+                    pick = pick or (ops, i1)
+        assert pick, "the pivot bits separate the pair and the single"
+        ops, i1 = pick
+        pivots = [Xr[p1], Xr[p2]]
+        x1, x2 = pivots[i1], pivots[1 - i1]
+        order = [j for j in reversed(range(n)) if j not in (p1, p2)]
 
-        def chain(acc, wires):
-            if EQ_TREE and wires:
-                root, history = and_tree(C, wires)
-                if acc is None:
-                    return root, history
-                (target,) = C.alloc(1)
-                C.ccx(acc, root, target)
-                return target, history + [(acc, root, target)]
-            history = []
-            for wire in wires:
-                if acc is None:
-                    acc = wire
+        def conjugate(inverse=False):
+            steps = [(pivots[src], pivots[dst]) for src, dst in ops]
+            steps += [(x1, Xr[j]) for j in order if pair_x >> j & 1]
+            steps += [(x2, Xr[j]) for j in order if single_x >> j & 1]
+            for src, dst in reversed(steps) if inverse else steps:
+                C.cx(src, dst)
+
+        undo = []
+
+        def flip(wires):
+            for w in wires:
+                C.x(w)
+
+        def chain(factors, target=None):
+            """AND of the factors, each a (wire, negated) literal or None for 1. With a target, XOR
+            it there and clear the chain; without, return it as a factor held until undo runs."""
+            factors = [f for f in factors if f is not None]
+            if target is None and len(factors) < 2:
+                return factors[0] if factors else None
+            flips = [w for w, neg in factors if neg]
+            wires = [w for w, _ in factors]
+            body = wires if target is None else wires[:-1]
+            made = []
+            flip(flips)
+            acc = body[0] if body else None
+            for w in body[1:]:
+                (t,) = C.alloc(1)
+                C.ccx(acc, w, t)
+                made.append((acc, w, t))
+                acc = t
+            if target is not None:
+                if not wires:
+                    C.x(target)
+                elif acc is None:
+                    C.cx(wires[-1], target)
                 else:
-                    (target,) = C.alloc(1)
-                    C.ccx(acc, wire, target)
-                    history.append((acc, wire, target))
-                    acc = target
-            return acc, history
+                    C.ccx(acc, wires[-1], target)
+            flip(flips)
 
-        def clear(history):
-            for left, right, target in reversed(history):
-                C.ccx(left, right, target)
-            C.free([target for _, _, target in history])
+            def clear():
+                flip(flips)
+                for a, b, t in reversed(made):
+                    C.ccx(a, b, t)
+                C.free([t for _, _, t in made])
+                flip(flips)
 
+            if target is not None:
+                clear()
+                return None
+            undo.append(clear)
+            return acc, False
+
+        conjugate()
+        prefix = ZeroPrefix(C, Xr, order)
+        prefix.build()
+        undo.append(prefix.clear)
+        zero = prefix.zero
+        y0 = Yr[0]
+
+        def less():
+            k = below[0]
+            # On lane (y1, y2), x ^ pair_x = r ^ d with d = pair_x*(1 ^ y1) ^ single_x*y2.
+            f00, f10, f01, f11 = (prefix.less(pair_x, (0 if y1 else pair_x) ^ (single_x if y2 else 0))
+                                  for y1, y2 in ((0, 0), (1, 0), (0, 1), (1, 1)))
+            (w, g) = C.alloc(2)
+            terms = [(x1, f00 ^ f10), (x2, f00 ^ f01), (None, f00 ^ f10 ^ f01 ^ f11)]
+
+            def value():
+                both = None
+                prefix.xor(f00, w)
+                for ctl, form in terms:
+                    if not form:
+                        continue
+                    if ctl is None:
+                        (both,) = C.alloc(1)
+                        C.ccx(x1, x2, both)
+                        ctl = both
+                    (t,) = C.alloc(1)
+                    prefix.xor(form, t)
+                    C.ccx(ctl, t, w)
+                    prefix.xor(form, t)
+                    C.free([t])
+                if both is not None:
+                    C.ccx(x1, x2, both)
+                    C.free([both])
+
+            def generic():
+                fz = groups[0][0][0]
+                C.cx(c, g)
+                C.ccx(c, fz, g)
+                for f in flags:
+                    if f != fz:
+                        C.cx(f, g)
+
+            value()
+            generic()
+            C.ccx(g, w, k)
+            generic()
+            value()
+            C.free([w, g])
+
+        if below and below[1]:
+            less()
         # The zero leaf is uncontrolled; c joins only on the nonzero branches.
-        for i in shared_zero:
-            C.x(Xr[i])
-        root, root_chain = chain(None, [Xr[i] for i in shared_zero])
-        zero_bits = [Xr[i] for i in shared_one + differing]
-        eq_const_into(C, root, zero_bits, 0, groups[0][0][0])
-        common, common_chain = chain(root, [c] + [Xr[i] for i in shared_one])
-        flips = [Xr[i] for i in differing if not (pair_x >> i & 1)]
-        for wire in flips:
-            C.x(wire)
-        leaf, leaf_chain = chain(common, [Xr[i] for i in differing])
+        chain([zero, (x1, True), (x2, True)], groups[0][0][0])
+        common = chain([zero, (c, False)])
+        leaf = chain([common, (x1, False), (x2, True)])
         for f, y in groups[pair_x]:
-            eq_const_into(C, leaf, Yr[:1], y & 1, f)
-        clear(leaf_chain)
-        for wire in flips:
-            C.x(wire)
+            chain([leaf, (y0, not y & 1)], f)
         f, y = groups[single_x][0]
-        bits = [Xr[i] for i in differing] + Yr[:1]
-        value = sum(((single_x >> i) & 1) << j for j, i in enumerate(differing))
-        value |= (y & 1) << len(differing)
-        eq_const_into(C, common, bits, value, f)
-        clear(common_chain)
-        clear(root_chain)
-        for i in shared_zero:
-            C.x(Xr[i])
+        chain([common, (x1, True), (x2, False), (y0, not y & 1)], f)
+        if below and not below[1]:
+            less()
+        for step in reversed(undo):
+            step()
+        conjugate(inverse=True)
 
     def build(self, hierarchical=False):
         curve, A = self.curve, self.A
@@ -1067,10 +2174,13 @@ class ControlledPointAdd:
         Xr, Yr = C.alloc(n), C.alloc(n)
         declared = Xr + Yr
         self.M = DialogMultiplier(C, self.mod)
-        self._modadd_blk = self._square_blk = None
+        self._modadd_blk = None
 
         flags = C.alloc(4)
-        self._eq_flags(c, Xr, Yr, flags, [e for e, _ in self.exceptions])
+        # The flag blocks' zero chain also compares x with a: the first block makes the wrap flag
+        # of the kernel's X -= a, and the second clears the reflect's.
+        (below,) = C.alloc(1)
+        self._eq_flags(c, Xr, Yr, flags, [e for e, _ in self.exceptions], below=(below, False))
         f0, f1, f2, gen = flags
         for f, (e_in, e_out) in zip(flags[1:], self.exceptions[1:]):
             load_const(C, Xr + Yr, encode(e_in, n) ^ encode(e_out, n), f)
@@ -1091,7 +2201,7 @@ class ControlledPointAdd:
         C.ccx(f0, f1, f2)
         C.free([f2])
 
-        gen = self._kernel(c, gen, Xr, Yr, f0, f1)
+        gen, below = self._kernel(c, gen, Xr, Yr, f0, f1, below)
 
         (f2,) = C.alloc(1)
         C.ccx(f0, f1, f2)
@@ -1101,8 +2211,8 @@ class ControlledPointAdd:
             C.cx(w, gen)
         C.ccx(c, f2, gen)
         flags = [f0, f1, f2, gen]
-        self._eq_flags(c, Xr, Yr, flags, [e for _, e in self.exceptions])
-        C.free(flags)
+        self._eq_flags(c, Xr, Yr, flags, [e for _, e in self.exceptions], below=(below, True))
+        C.free(flags + [below])
 
         _restore_layout(C, Xr + Yr, declared)
         self.layout = {"control": [c], "x": declared[:n], "y": declared[n:]}
